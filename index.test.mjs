@@ -357,6 +357,118 @@ test("stream does not retry expired authentication or trial audio", async () => 
   }
 });
 
+// A song with no lossless source must still play at the level that has one:
+// asking once and skipping was the reported "next track skipped a song".
+test("stream asks the level below only when this level has no source", async () => {
+  const levels = [];
+  const { plugin, storage } = await setup(async (_url, init) => {
+    const { data } = decode(init.body);
+    levels.push(data.level);
+    if (data.level === "lossless") {
+      return response({ code: 200, data: [{ id: 1, url: null, code: 404, level: "lossless", freeTrialInfo: null }] });
+    }
+    return response({ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh" }] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const audio = await plugin.stream({ id: "1", quality: "lossless" });
+  assert.deepEqual(levels, ["lossless", "exhigh"]);
+  // The host caches what actually plays, so the level it reports decides
+  // whether a later play of the same song is served from the cache.
+  assert.equal(audio.quality, "high");
+  assert.deepEqual(storage.get("streamLog").map(entry => [entry.song, entry.level, entry.outcome, entry.hasURL]), [
+    ["1", "lossless", "missing", false],
+    ["1", "exhigh", "ok", true],
+  ]);
+});
+
+// A trial is what the account may play. Asking lower cannot give more, and
+// handing the clip over would play a preview as if it were the song.
+test("stream never falls back after a trial or into one", async () => {
+  const levels = [];
+  const { plugin, storage } = await setup(async (_url, init) => {
+    levels.push(decode(init.body).data.level);
+    return response({ code: 200, data: [{ id: 1, url: "https://m1.music.126.net/clip.mp3", code: 200, level: "lossless", freeTrialInfo: { start: 0, end: 30 } }] });
+  });
+  await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), { code: "unavailable" });
+  assert.deepEqual(levels, ["lossless"]);
+  assert.equal(storage.get("streamLog")[0].trial, true);
+});
+
+// A server error or a timeout says nothing about this song's levels, so it is
+// retried at the quality asked for and never answered by a lower one.
+test("stream retries a moment's failure at the same level, not a lower one", async () => {
+  const levels = [];
+  const { plugin, storage } = await setup(async (_url, init) => {
+    levels.push(decode(init.body).data.level);
+    return { ok: false, status: 503, json: async () => ({}), headers: { getSetCookie: () => [] } };
+  });
+  await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), /HTTP 503/);
+  assert.deepEqual(levels, ["lossless", "lossless"]);
+  assert.deepEqual(storage.get("streamLog").map(entry => entry.outcome), ["transient", "transient"]);
+});
+
+// An empty answer is a soft refusal, not proof that the account lacks the
+// right to play the song: it must not become a permission error or a downgrade.
+test("stream does not call an empty answer a permission problem", async () => {
+  const levels = [];
+  const { plugin } = await setup(async (_url, init) => {
+    levels.push(decode(init.body).data.level);
+    return response({ code: 200, data: [] });
+  });
+  await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), (error) => {
+    assert.equal(error.code, undefined);
+    assert.match(error.message, /未返回这首歌的音源/);
+    return true;
+  });
+  assert.deepEqual(levels, ["lossless", "lossless"]);
+});
+
+// A content 401 must not sign the listener out: the session is still valid, and
+// signing out loses their library over one song the account may not open.
+test("stream keeps the session when a content 401 comes back", async () => {
+  const { plugin, storage } = await setup(async (_url, init) => {
+    if (init.headers.Cookie !== undefined && !init.headers.Cookie.includes("MUSIC_U=synthetic-session")) {
+      throw new Error("session was lost");
+    }
+    return response({ code: 401 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  await assert.rejects(plugin.stream({ id: "2" }), { code: "unavailable" });
+});
+
+// Diagnostics are kept for reading later, so they are bounded and hold nothing
+// that could identify the listener or the audio.
+test("stream diagnostics stay bounded and leave out URLs and cookies", async () => {
+  const { plugin, storage } = await setup(async () => response({ code: 200, data: [
+    { id: 1, code: 200, url: "https://m1.music.126.net/song.mp3?token=audio%2Ftoken&expires=123", type: "mp3", level: "exhigh" },
+  ] }), { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  for (let i = 0; i < 25; i++) await plugin.stream({ id: "1" });
+  const log = storage.get("streamLog");
+  assert.equal(log.length, 20);
+  const saved = JSON.stringify(log);
+  assert.ok(!saved.includes("audio%2Ftoken&expires=123"), saved);
+  assert.ok(!saved.includes("synthetic-session"), saved);
+  assert.ok(!saved.includes("https://"), saved);
+  assert.deepEqual(Object.keys(log[0]).sort(), ["actual", "at", "code", "hasURL", "level", "outcome", "song", "trial"]);
+  assert.deepEqual([log[0].song, log[0].level, log[0].code, log[0].hasURL, log[0].trial, log[0].actual],
+    ["1", "exhigh", 200, true, false, "exhigh"]);
+});
+
+// NetEase's immersive levels have no host name of their own. A lossless file
+// kept as "high" is downloaded again on every lossless play; a lossy file kept
+// as "lossless" would be served to lossless requests instead.
+test("stream reports the quality the response proves", async () => {
+  for (const [level, type, quality] of [
+    ["jymaster", "flac", "lossless"], ["sky", "flac", "lossless"], ["jymaster", "mp3", "high"],
+    [undefined, "flac", "lossless"], [undefined, "mp3", "high"], ["hires", "flac", "lossless"],
+  ]) {
+    const { plugin } = await setup(async () => response({ code: 200, data: [
+      { id: 1, code: 200, url: "https://m1.music.126.net/song", type, level },
+    ] }));
+    assert.equal((await plugin.stream({ id: "1", quality: "lossless" })).quality, quality, `${level} ${type}`);
+  }
+});
+
 // Personal recommendations require a real session before making their requests.
 test("guests can discover entries but private recommendations ask for sign-in", async () => {
   let calls = 0;

@@ -13,6 +13,16 @@ const PAGE_SIZE = 30;
 const PLAYLIST_LIMIT = 1000;
 const PRIVATE_RADAR = "3136952023";
 const COOKIE_NAMES = ["MUSIC_U", "__csrf", "NMTID"];
+// Quality order the host understands, and NetEase's names for it. Asking goes
+// down one level at a time, never past standard, never into a trial.
+const STREAM_LEVELS = { standard: "standard", high: "exhigh", lossless: "lossless" };
+const LOWER_QUALITY = { lossless: "high", high: "standard", standard: null };
+const QUALITY_NAMES = { standard: "标准音质", high: "高音质", lossless: "无损" };
+// One request, and one retry of a failure that may have been a moment's.
+const STREAM_ATTEMPTS = 2;
+const STREAM_RETRY_MS = 1000;
+// The last attempts kept for reading later, as a ring.
+const DIAGNOSTIC_LIMIT = 20;
 
 // MyGo 0.1.6 loads a module while holding the storage mutex. Host calls must
 // happen inside an exported action, never during module initialization.
@@ -33,6 +43,23 @@ function currentSession() {
 function fail(code, message) {
   const error = new Error(message);
   error.code = code;
+  return error;
+}
+
+// A failure the next attempt may not have: a timeout, a refused request, or a
+// server error. Nothing else is marked, so a missing source is never retried
+// as if waiting would fix it, and a moment's failure is never answered by
+// asking for a lower quality.
+function transientFailure(message, neteaseCode) {
+  const error = new Error(message);
+  error.transient = true;
+  if (neteaseCode !== undefined) error.neteaseCode = neteaseCode;
+  return error;
+}
+
+function httpFailure(status) {
+  const error = new Error(`网易云请求失败（HTTP ${status}）`);
+  error.transient = status >= 500 || status === 429;
   return error;
 }
 
@@ -174,13 +201,13 @@ async function request(path, params = {}, options = {}) {
   let response, body;
   try {
     response = await fetch(url, init);
-    if (!response.ok) throw new Error(`网易云请求失败（HTTP ${response.status}）`);
+    if (!response.ok) throw httpFailure(response.status);
     body = await response.json();
   } catch (error) {
-    if (controller.signal.aborted) throw new Error("网易云请求超时，请稍后重试");
+    if (controller.signal.aborted) throw transientFailure("网易云请求超时，请稍后重试");
     // Never put response bodies, request headers or login cookies in errors.
     if (response && !response.ok) throw error;
-    throw new Error("无法读取网易云音乐，请检查网络及系统代理后重试");
+    throw transientFailure("无法读取网易云音乐，请检查网络及系统代理后重试");
   } finally {
     clearTimeout(timer);
   }
@@ -189,12 +216,14 @@ async function request(path, params = {}, options = {}) {
   const code = Number(body.code);
   const allowed = options.codes || [200];
   if (!allowed.includes(code)) {
-    // Content access can be forbidden while the account is still signed in.
-    if (code === 401 && options.keepSession) {
+    // NetEase answers 401 for content this account may not open while the
+    // session is still valid. Clearing it would sign the listener out over one
+    // song, so keep the session: only 301 and 302 say the login itself expired.
+    if (code === 401) {
       acceptResponseCookies(response, activeSession);
       throw fail("unavailable", "当前账号无权访问该内容");
     }
-    if ([301, 302, 401].includes(code)) {
+    if ([301, 302].includes(code)) {
       if (activeSession === session) clearSession();
       throw fail("signIn", "请重新登录网易云音乐");
     }
@@ -202,11 +231,9 @@ async function request(path, params = {}, options = {}) {
       // A refused response can still renew NMTID. Keep the server's cookie
       // update for the same device/account retry, including session expiry.
       acceptResponseCookies(response, activeSession);
-      const error = new Error(`网易云暂时拒绝了请求（${code}），请稍后重试`);
-      error.neteaseCode = code;
-      throw error;
+      throw transientFailure(`网易云暂时拒绝了请求（${code}），请稍后重试`, code);
     }
-    if (code === 405) throw new Error("网易云暂时限制了请求，请稍后再试");
+    if (code === 405) throw transientFailure("网易云暂时限制了请求，请稍后再试");
     throw new Error(`网易云接口返回错误（${Number.isFinite(code) ? code : "未知"}）`);
   }
   acceptResponseCookies(response, activeSession);
@@ -508,7 +535,7 @@ export async function shows() {
   await requireAccount();
   const result = new Map();
   for (let offset = 0; offset < 2000;) {
-    const data = await request("/api/djradio/get/subed", { limit: 100, offset, total: "true" }, { keepSession: true });
+    const data = await request("/api/djradio/get/subed", { limit: 100, offset, total: "true" });
     const items = data.djRadios || [];
     const previousSize = result.size;
     for (const item of items) result.set(String(item.id), { ...toShow(item), subscribed: true });
@@ -525,8 +552,8 @@ export async function show({ id, offset = 0 }) {
   id = idOf(id);
   offset = pageOffset(offset);
   const [detail, programs] = await Promise.all([
-    request("/api/djradio/v2/get", { id }, { keepSession: true }),
-    request("/api/dj/program/byradio", { radioId: id, limit: PAGE_SIZE, offset, asc: "false" }, { keepSession: true }),
+    request("/api/djradio/v2/get", { id }),
+    request("/api/dj/program/byradio", { radioId: id, limit: PAGE_SIZE, offset, asc: "false" }),
   ]);
   if (!detail.data || String(detail.data.id) !== id) throw fail("unavailable", "播客不存在或当前账号无权访问");
   return {
@@ -621,7 +648,7 @@ async function submitPlaylistTracks(op, id, ids, activeSession, generation) {
   if (activeSession.cookies.__csrf) form.set("csrf_token", activeSession.cookies.__csrf);
   try {
     const data = await request("/api/playlist/manipulate/tracks", {}, {
-      session: activeSession, form: form.toString(), keepSession: true, codes: [200, 502],
+      session: activeSession, form: form.toString(), codes: [200, 502],
     });
     checkPlaylistSession(activeSession, generation);
     return data;
@@ -635,7 +662,7 @@ async function submitPlaylistTracks(op, id, ids, activeSession, generation) {
 async function playlistTrackIDs(id, activeSession, generation) {
   checkPlaylistSession(activeSession, generation);
   const data = await request("/api/v6/playlist/detail", { id, n: PLAYLIST_LIMIT }, {
-    session: activeSession, keepSession: true,
+    session: activeSession,
   });
   checkPlaylistSession(activeSession, generation);
   const source = data.playlist;
@@ -690,7 +717,7 @@ export async function comments({ trackId, offset = 0 }) {
   const identity = trackIdentity(trackId);
   const data = await request(`/api/v1/resource/comments/${identity.thread}`, {
     limit: PAGE_SIZE, offset: pageOffset(offset),
-  }, { keepSession: true });
+  });
   // Hot comments overlap the chronological list. Adding them here would make
   // the host skip comments when it advances by the number already displayed.
   return { comments: (data.comments || []).map(toComment), total: data.total || 0, more: !!data.more };
@@ -710,7 +737,7 @@ export async function lyrics({ id }) {
   if (activeSession !== session || generation !== epoch) throw new Error("账号状态已改变，请重试");
   const desktop = await eapi("/api/song/lyric/v1", {
     id: identity.audio, cp: false, tv: 0, lv: 0, rv: 0, kv: 0, yv: 0, ytv: 0, yrv: 0,
-  }, { session: activeSession, keepSession: true });
+  }, { session: activeSession });
   if (activeSession !== session || generation !== epoch) throw new Error("账号状态已改变，请重试");
   return { lrc: desktop.lrc?.lyric || "", translation: desktop.tlyric?.lyric || translation };
 }
@@ -728,40 +755,133 @@ export async function stream({ id, quality = "high" }) {
 }
 
 async function loadStream(id, quality, generation) {
-  const level = { standard: "standard", high: "exhigh", lossless: "lossless" }[quality] || "exhigh";
-  let data;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (generation !== epoch) throw new Error("账号状态已改变，请重试");
-    try {
-      data = await eapi("/api/song/enhance/player/url/v1", {
-        ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
-      });
-      break;
-    } catch (error) {
-      if (![460, -460].includes(error.neteaseCode)) throw error;
-      if (attempt === 1) throw new Error(`网易云仍拒绝播放请求（${error.neteaseCode}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
-      // One delayed retry of this read only, with the same device/account and
-      // quality. Never retry account mutations or turn permission failures
-      // into a different source, a preview, or a lower-quality success.
-      await new Promise(resolve => setTimeout(resolve, 1000));
+  const records = [];
+  const tried = [];
+  let missing = "";
+  try {
+    for (let ask = STREAM_LEVELS[quality] ? quality : "high"; ask; ask = LOWER_QUALITY[ask]) {
+      const level = STREAM_LEVELS[ask];
+      tried.push(QUALITY_NAMES[ask]);
+      for (let attempt = 1; ; attempt++) {
+        if (generation !== epoch) throw new Error("账号状态已改变，请重试");
+        let data;
+        try {
+          data = await eapi("/api/song/enhance/player/url/v1", {
+            ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
+          });
+        } catch (error) {
+          records.push(streamDiagnostic(id, level, error.transient ? "transient" : "error"));
+          if (!error.transient) throw error;
+          if (attempt >= STREAM_ATTEMPTS) {
+            // Still refused at the quality asked for, so this song may play
+            // later: say that, and never turn a refusal into a lower level.
+            if ([460, -460].includes(error.neteaseCode)) {
+              throw new Error(`网易云仍拒绝播放请求（${error.neteaseCode}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
+            }
+            throw error;
+          }
+          await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+          continue;
+        }
+        const audio = (data.data || []).find((item) => String(item.id) === id);
+        if (!audio) {
+          // A success without this song's record is a soft refusal or a moment
+          // of the service, not proof that the account may not play it.
+          records.push(streamDiagnostic(id, level, "empty", null, data.code));
+          if (attempt < STREAM_ATTEMPTS) {
+            await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+            continue;
+          }
+          throw new Error("网易云未返回这首歌的音源，请稍后重试");
+        }
+        const code = audio.code == null ? null : Number(audio.code);
+        if (audio.freeTrialInfo != null) {
+          // A trial is all this account may play: a lower level never gives
+          // more, so never fall back, and never hand the clip to the host.
+          records.push(streamDiagnostic(id, level, "trial", audio, code));
+          throw fail("unavailable", "当前账号只有这首歌的试听权限，无法播放完整版本");
+        }
+        if ([460, -460].includes(code)) {
+          records.push(streamDiagnostic(id, level, "transient", audio, code));
+          if (attempt < STREAM_ATTEMPTS) {
+            await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+            continue;
+          }
+          throw new Error(`网易云仍拒绝播放请求（${code}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
+        }
+        if ([401, 403].includes(code)) {
+          records.push(streamDiagnostic(id, level, "denied", audio, code));
+          throw fail("unavailable", "当前账号无权播放这首歌");
+        }
+        if (!audio.url || (code != null && code !== 200)) {
+          // The service answered for this song, and has no source at this
+          // level. The level below may still have one: ask it, within bounds.
+          records.push(streamDiagnostic(id, level, "missing", audio, code));
+          missing = `网易云未返回可播放音源（已尝试：${tried.join("、")}）`;
+          break;
+        }
+        const url = new URL(secureURL(audio.url));
+        const type = String(audio.type || "mp3").toLowerCase();
+        if (url.protocol !== "https:" || !/^(?:[a-z0-9-]+\.)*music\.126\.net$/i.test(url.hostname)) {
+          records.push(streamDiagnostic(id, level, "error", audio, code));
+          throw fail("unavailable", "网易云返回了不支持的音频地址");
+        }
+        if (!["mp3", "flac", "ogg"].includes(type)) {
+          records.push(streamDiagnostic(id, level, "error", audio, code));
+          throw fail("unavailable", "该歌曲的音频格式暂不支持");
+        }
+        records.push(streamDiagnostic(id, level, "ok", audio, code));
+        return {
+          url: url.toString(), type, size: audio.size || 0, bitRate: audio.br || 0,
+          quality: streamQuality(audio), gain: audio.gain || 0, peak: audio.peak || 0,
+          headers: { "User-Agent": UA, Referer: `${SITE}/` },
+        };
+      }
     }
+    throw fail("unavailable", missing || "当前账号无完整播放权限，或歌曲在当前地区不可用");
+  } finally {
+    rememberStreamDiagnostics(records);
   }
-  const audio = (data.data || []).find((item) => String(item.id) === id);
-  if (!audio || !audio.url || (audio.code !== undefined && audio.code !== 200) || audio.freeTrialInfo != null) {
-    throw fail("unavailable", "当前账号无完整播放权限，或歌曲在当前地区不可用");
-  }
-  const url = new URL(secureURL(audio.url));
-  if (url.protocol !== "https:" || !/^(?:[a-z0-9-]+\.)*music\.126\.net$/i.test(url.hostname)) {
-    throw fail("unavailable", "网易云返回了不支持的音频地址");
-  }
-  const type = String(audio.type || "mp3").toLowerCase();
-  if (!["mp3", "flac", "ogg"].includes(type)) throw fail("unavailable", "该歌曲的音频格式暂不支持");
+}
+
+// NetEase names more levels than the host has: higher, exhigh, hires, and the
+// immersive ones it reports only by name. Say what the stream proves, and never
+// call a lossy file lossless: the cache keeps it under that name, and then
+// answers later lossless requests with it.
+function streamQuality(audio) {
+  const level = String(audio.level || "").toLowerCase();
+  if (level === "standard") return "standard";
+  if (["lossless", "hires"].includes(level)) return "lossless";
+  if (["higher", "exhigh"].includes(level)) return "high";
+  return String(audio.type || "").toLowerCase() === "flac" ? "lossless" : "high";
+}
+
+// One line per attempt, with what tells a refusal from a missing level and a
+// trial, and nothing else. Never a URL, its query, a cookie, a header or an
+// account: this is kept where the listener can read it.
+function streamDiagnostic(id, level, outcome, audio = null, code = null) {
+  const result = code == null ? null : Number(code);
   return {
-    url: url.toString(), type, size: audio.size || 0, bitRate: audio.br || 0,
-    quality: ["lossless", "hires"].includes(audio.level) ? "lossless" : audio.level === "standard" ? "standard" : "high",
-    gain: audio.gain || 0, peak: audio.peak || 0,
-    headers: { "User-Agent": UA, Referer: `${SITE}/` },
+    at: new Date().toISOString(), song: String(id), level, outcome,
+    code: Number.isFinite(result) ? result : null,
+    hasURL: !!(audio && audio.url),
+    trial: !!(audio && audio.freeTrialInfo != null),
+    actual: audio && audio.level ? String(audio.level) : null,
   };
+}
+
+// The host has no log to read and discards console output, so the plugin keeps
+// the last few attempts in its own storage instead: bounded, so reading it
+// later never has to rotate it, and never with anything to identify anyone.
+function rememberStreamDiagnostics(records) {
+  if (!records.length) return;
+  try {
+    const saved = host.storage.get("streamLog");
+    const log = Array.isArray(saved) ? saved : [];
+    host.storage.set("streamLog", log.concat(records).slice(-DIAGNOSTIC_LIMIT));
+  } catch {
+    // What is kept for reading later must never fail a play.
+  }
 }
 
 // The host asks stationNext again as the queue runs out. These modes are
@@ -798,7 +918,7 @@ async function startHeart(activeSession, generation, profile) {
   let likedPlaylist;
   for (let offset = 0; offset < 2000; offset += 200) {
     const data = await request("/api/user/playlist", { uid: profile.id, limit: 200, offset }, {
-      session: activeSession, keepSession: true,
+      session: activeSession,
     });
     checkHeartAccount(activeSession, generation);
     if (!Array.isArray(data.playlist)) throw new Error("无法读取喜欢的音乐歌单");
@@ -810,7 +930,7 @@ async function startHeart(activeSession, generation, profile) {
   if (!likedPlaylist) throw fail("unavailable", "未找到当前账号的喜欢歌单，暂时无法开启心动模式");
   const playlistID = idOf(likedPlaylist.id);
   const data = await request("/api/v6/playlist/detail", { id: playlistID, n: 1 }, {
-    session: activeSession, keepSession: true,
+    session: activeSession,
   });
   checkHeartAccount(activeSession, generation);
   const playlist = data.playlist;
@@ -842,7 +962,7 @@ async function loadHeart(activeSession, generation) {
     const data = await eapi("/api/playmode/intelligence/list", {
       songId: cursor, startMusicId: state.seed, playlistId: state.playlistID,
       type: "fromPlayOne", count: 1,
-    }, { session: activeSession, keepSession: true });
+    }, { session: activeSession });
     checkHeartAccount(activeSession, generation);
     if (!Array.isArray(data.data)) throw new Error("网易云未返回有效的心动推荐列表");
     const songs = [];
@@ -858,7 +978,7 @@ async function loadHeart(activeSession, generation) {
     }
     if (songs.length) {
       const ids = songs.map(song => idOf(song.id));
-      const tracks = (await songDetails(ids, songs, { session: activeSession, keepSession: true })).map(toTrack);
+      const tracks = (await songDetails(ids, songs, { session: activeSession })).map(toTrack);
       checkHeartAccount(activeSession, generation);
       heartState = { ...state, last: nextCursor, seen: [...seen].slice(-200) };
       return tracks;
@@ -893,7 +1013,7 @@ export async function stationNext({ id }) {
   if (songs.length === 0) {
     let personalizationDisabled = false;
     try {
-      const preferences = await request("/api/user/setting", {}, { keepSession: true });
+      const preferences = await request("/api/user/setting", {});
       personalizationDisabled = preferences.setting?.personalServiceSetting === 2;
     } catch (error) {
       // A diagnostic lookup must not turn a transient empty batch into a new
