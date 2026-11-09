@@ -406,6 +406,51 @@ test("stream retries a moment's failure at the same level, not a lower one", asy
   assert.deepEqual(storage.get("streamLog").map(entry => entry.outcome), ["transient", "transient"]);
 });
 
+// The diagnostic must name the code that refused, so a reader can tell a
+// throttled request from a lost network. A missing code made 460 look unknown.
+test("stream records the NetEase code that refused the request", async () => {
+  for (const code of [460, -460]) {
+    const { plugin, storage } = await setup(async () => response({ code }));
+    await assert.rejects(plugin.stream({ id: "1" }), new RegExp(`仍拒绝播放请求（${code}）`));
+    assert.deepEqual(storage.get("streamLog").map(entry => [entry.outcome, entry.code]), [
+      ["transient", code], ["transient", code],
+    ], String(code));
+  }
+});
+
+// NetEase reports throttling and server errors inside the song record too, with
+// a successful transport. Only waiting can change that answer, so it is retried
+// at the level asked for, never read as "this level has no source".
+test("stream retries a moment's failure inside the song record at the same level", async () => {
+  for (const code of [429, 500, 502, 503]) {
+    const levels = [];
+    const { plugin, storage } = await setup(async (_url, init) => {
+      levels.push(decode(init.body).data.level);
+      return response({ code: 200, data: [{ id: 1, code, url: null, level: "lossless", freeTrialInfo: null }] });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), new RegExp(`暂时无法返回音源（${code}）`));
+    assert.deepEqual(levels, ["lossless", "lossless"], String(code));
+    assert.deepEqual(storage.get("streamLog").map(entry => [entry.level, entry.outcome, entry.code]), [
+      ["lossless", "transient", code], ["lossless", "transient", code],
+    ], String(code));
+  }
+});
+
+// The retry is a wait, not a downgrade: the next answer plays the level asked for.
+test("stream plays at the asked level after one transitory song record", async () => {
+  let calls = 0;
+  const { plugin, storage } = await setup(async () => {
+    calls++;
+    if (calls === 1) return response({ code: 200, data: [{ id: 1, code: 429, level: "lossless", freeTrialInfo: null }] });
+    return response({ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/song.flac", type: "flac", level: "lossless" }] });
+  });
+  const audio = await plugin.stream({ id: "1", quality: "lossless" });
+  assert.equal(audio.type, "flac");
+  assert.equal(audio.quality, "lossless");
+  assert.equal(calls, 2);
+  assert.deepEqual(storage.get("streamLog").map(entry => entry.outcome), ["transient", "ok"]);
+});
+
 // An empty answer is a soft refusal, not proof that the account lacks the
 // right to play the song: it must not become a permission error or a downgrade.
 test("stream does not call an empty answer a permission problem", async () => {

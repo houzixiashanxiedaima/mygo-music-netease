@@ -57,6 +57,13 @@ function transientFailure(message, neteaseCode) {
   return error;
 }
 
+// The same moment of refusal also arrives inside a song's record when the
+// transport succeeded. Another level asks the same server for the same song,
+// so only waiting can change this answer.
+function transientCode(code) {
+  return code === 429 || (code >= 500 && code <= 599);
+}
+
 function httpFailure(status) {
   const error = new Error(`网易云请求失败（HTTP ${status}）`);
   error.transient = status >= 500 || status === 429;
@@ -770,7 +777,7 @@ async function loadStream(id, quality, generation) {
             ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
           });
         } catch (error) {
-          records.push(streamDiagnostic(id, level, error.transient ? "transient" : "error"));
+          records.push(streamDiagnostic(id, level, error.transient ? "transient" : "error", null, error.neteaseCode));
           if (!error.transient) throw error;
           if (attempt >= STREAM_ATTEMPTS) {
             // Still refused at the quality asked for, so this song may play
@@ -812,6 +819,16 @@ async function loadStream(id, quality, generation) {
         if ([401, 403].includes(code)) {
           records.push(streamDiagnostic(id, level, "denied", audio, code));
           throw fail("unavailable", "当前账号无权播放这首歌");
+        }
+        if (transientCode(code)) {
+          // Throttling and server errors say nothing about this level either:
+          // answer them the way a failed request is answered, at the same level.
+          records.push(streamDiagnostic(id, level, "transient", audio, code));
+          if (attempt < STREAM_ATTEMPTS) {
+            await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+            continue;
+          }
+          throw new Error(`网易云暂时无法返回音源（${code}），请稍后重试`);
         }
         if (!audio.url || (code != null && code !== 200)) {
           // The service answered for this song, and has no source at this
