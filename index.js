@@ -1281,17 +1281,15 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
             ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
           }, { deadline, session: activeSession, streamSession: activeSession, responseMeta });
         } catch (error) {
-          records.push(diagnose(id, level, error.transient ? "transient" : "error", null, error.neteaseCode));
+          const refused = [460, -460].includes(error.neteaseCode);
+          records.push(diagnose(id, level, refused ? "refused" : error.transient ? "transient" : "error", null, error.neteaseCode));
+          if (refused) {
+            coolDownStreams(error.retryAfterMs);
+            throw neteaseRefusal(error.neteaseCode, `网易云拒绝播放请求（${error.neteaseCode}），本次取源不重试`);
+          }
           if (error.deadline || !error.transient) throw error;
           coolDownStreams(error.retryAfterMs);
-          if (attempt >= STREAM_ATTEMPTS) {
-            // Still refused at the quality asked for, so this song may play
-            // later: say that, and never turn a refusal into a lower level.
-            if ([460, -460].includes(error.neteaseCode)) {
-              throw new Error(`网易云仍拒绝播放请求（${error.neteaseCode}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
-            }
-            throw error;
-          }
+          if (attempt >= STREAM_ATTEMPTS) throw error;
           await waited(waitForStreamRetry(error, deadline));
           continue;
         }
@@ -1315,13 +1313,9 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
           throw fail("unavailable", "当前账号只有这首歌的试听权限，无法播放完整版本");
         }
         if ([460, -460].includes(code)) {
-          records.push(diagnose(id, level, "transient", audio, code));
+          records.push(diagnose(id, level, "refused", audio, code));
           coolDownStreams(responseMeta.retryAfterMs);
-          if (attempt < STREAM_ATTEMPTS) {
-            await waited(waitForStreamCooldown(deadline, Math.max(STREAM_RETRY_MS, responseMeta.retryAfterMs || 0)));
-            continue;
-          }
-          throw new Error(`网易云仍拒绝播放请求（${code}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
+          throw neteaseRefusal(code, `网易云拒绝播放请求（${code}），本次取源不重试`);
         }
         if (code === 401) {
           // A 401 inside the song record may be this song's permission or an

@@ -333,36 +333,52 @@ test("normal cookie renewal remains persisted", async () => {
   assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-renewed");
 });
 
-// Concurrent requests share a single retry, using the same identity and quality.
-test("stream recovers from one 460 without duplicating concurrent requests", async () => {
-  for (const code of [460, -460]) {
-    const requests = [];
-    const { plugin } = await setup(async (_url, init) => {
-      requests.push(decode(init.body).data);
-      if (requests.length === 1) return response({ code });
-      return response({ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", freeTrialInfo: null }] });
-    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
-    const [a, b] = await Promise.all([plugin.stream({ id: "1" }), plugin.stream({ id: "1" })]);
-    assert.deepEqual(a, b);
-    assert.equal(requests.length, 2);
-    assert.equal(requests[0].header.deviceId, requests[1].header.deviceId);
-    assert.equal(requests[0].header.MUSIC_U, requests[1].header.MUSIC_U);
-    assert.equal(requests[0].level, requests[1].level);
+// Refusals stop this call. Concurrent requests still share one attempt, and
+// a later explicit call is allowed: this is not a permanent song blacklist.
+test("stream stops 460 without retrying concurrent calls or lowering quality", async () => {
+  const cases = [
+    { code: 460, body: { code: 460 } },
+    { code: -460, body: { code: -460 } },
+    ...[460, -460].map(code => ({ code, body: { code: 200, data: [
+      { id: 1, code, url: "https://m1.music.126.net/source.flac", type: "flac" },
+    ] } })),
+    { code: 460, http: true },
+  ];
+  for (const fixture of cases) {
+    const levels = [];
+    const { plugin, storage } = await setup(async (_url, init) => {
+      levels.push(decode(init.body).data.level);
+      return fixture.http ? { ok: false, status: 460, headers: { get: () => null } } : response(fixture.body);
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7" } });
+    const outcomes = await Promise.allSettled([
+      plugin.stream({ id: "1", quality: "lossless" }),
+      plugin.stream({ id: "1", quality: "lossless" }),
+    ]);
+    assert.deepEqual(levels, ["lossless"], "one actual request, no retry or fallback");
+    for (const result of outcomes) {
+      assert.equal(result.status, "rejected");
+      assert.equal(result.reason.neteaseCode, fixture.code);
+      assert.notEqual(result.reason.code, "signIn");
+      assert.match(result.reason.message, /不重试/);
+    }
+    const log = storage.get("streamLog");
+    assert.equal(log.length, 1);
+    assert.deepEqual([log[0].code, log[0].outcome, log[0].attempt], [fixture.code, "refused", 1]);
+    assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
   }
 });
 
-// Persistent rejection stops after two attempts, and the failed promise isn't cached.
-test("stream bounds persistent 460 retries and releases the in-flight entry", async () => {
+test("460 releases its in-flight entry and allows a later explicit call", async () => {
   let calls = 0;
   const { plugin } = await setup(async () => {
     calls++;
-    if (calls <= 2) return response({ code: -460 });
+    if (calls === 1) return response({ code: -460 });
     return response({ code: 200, data: [{ id: 1, url: "https://m1.music.126.net/song.mp3", freeTrialInfo: null }] });
   });
-  await assert.rejects(plugin.stream({ id: "1" }), /仍拒绝播放请求（-460）/);
-  assert.equal(calls, 2);
+  await assert.rejects(plugin.stream({ id: "1" }), /不重试/);
+  assert.equal(calls, 1);
   assert.equal((await plugin.stream({ id: "1" })).type, "mp3");
-  assert.equal(calls, 3);
+  assert.equal(calls, 2);
 });
 
 // Signing out during backoff must prevent the retry from using another session.
@@ -377,7 +393,7 @@ test("sign-out cancels a scheduled playback retry", async (t) => {
     return timer(fn, ms, ...args);
   });
   let calls = 0;
-  const { plugin } = await setup(async () => { calls++; return response({ code: -460 }); });
+  const { plugin } = await setup(async () => { calls++; return response({ code: 503 }); });
   const playing = plugin.stream({ id: "1" });
   await queued;
   plugin.signOut();
@@ -453,9 +469,9 @@ test("stream retries a moment's failure at the same level, not a lower one", asy
 test("stream records the NetEase code that refused the request", async () => {
   for (const code of [460, -460]) {
     const { plugin, storage } = await setup(async () => response({ code }));
-    await assert.rejects(plugin.stream({ id: "1" }), new RegExp(`仍拒绝播放请求（${code}）`));
+    await assert.rejects(plugin.stream({ id: "1" }), new RegExp(`拒绝播放请求（${code}）`));
     assert.deepEqual(storage.get("streamLog").map(entry => [entry.outcome, entry.code]), [
-      ["transient", code], ["transient", code],
+      ["refused", code],
     ], String(code));
   }
 });
@@ -833,7 +849,7 @@ test("cooldown releases different songs in separate request slots", async (t) =>
   const { plugin, storage } = await setup(async (_url, init) => {
     const id = JSON.parse(decode(init.body).data.ids)[0];
     starts.push({ id, at: Date.now() });
-    if (!refused) { refused = true; return response({ code: -460 }); }
+    if (!refused) { refused = true; return response({ code: 503 }); }
     return response({ code: 200, data: [{ id, code: 200, url: "https://m1.music.126.net/source.flac", type: "flac" }] });
   });
   const settle = async () => { for (let i = 0; i < 12; i++) await flush(); };
@@ -992,29 +1008,22 @@ test("a refusal cools down source fetches without blocking other APIs", async (t
     if (url.includes("/song/enhance/player/url/v1")) return response({ code: -460 });
     return response({ code: 200, result: [] });
   });
-  const sourceCalls = () => requests.filter((url) => url.includes("/song/enhance/player/url/v1")).length;
-  const first = plugin.stream({ id: "1" }).then((value) => ({ value }), (error) => ({ error }));
+  const sourceCalls = () => requests.filter(url => url.includes("/song/enhance/player/url/v1")).length;
+  const first = plugin.stream({ id: "1" }).catch(error => error);
   await flush();
+  assert.match((await first).message, /不重试/);
   assert.equal(sourceCalls(), 1);
-  t.mock.timers.tick(2000);
-  await flush();
-  const firstOutcome = await first;
-  assert.match(firstOutcome.error.message, /仍拒绝播放请求（-460）/);
-  assert.equal(sourceCalls(), 2);
-  // An unrelated read answers while the cooldown is still active.
   const before = requests.length;
   await plugin.home();
   assert.equal(requests.length, before + 1);
-  const second = plugin.stream({ id: "2" }).then((value) => ({ value }), (error) => ({ error }));
+  const second = plugin.stream({ id: "2" }).catch(error => error);
   await flush();
-  assert.equal(sourceCalls(), 2, "no source request while cooling down");
-  t.mock.timers.tick(2000);
-  await flush();
-  assert.equal(sourceCalls(), 3);
-  t.mock.timers.tick(2000);
-  await flush();
-  const secondOutcome = await second;
-  assert.match(secondOutcome.error.message, /仍拒绝播放请求（-460）/);
+  assert.equal(sourceCalls(), 1, "next song still respects the shared cooldown");
+  t.mock.timers.tick(1999); await flush();
+  assert.equal(sourceCalls(), 1);
+  t.mock.timers.tick(1); await flush();
+  assert.equal(sourceCalls(), 2);
+  assert.match((await second).message, /不重试/);
 });
 
 // A request that hangs must stop before the host's 30s timeout. The budget
