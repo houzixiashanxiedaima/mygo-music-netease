@@ -52,3 +52,15 @@ The unexposed heart-mode candidate is adapted from `HeartMode` in
 `internal/netease/radio.go` at the same preserved upstream commit. Its request
 uses NetEase's intelligence endpoint; live continuation and account validation
 remain pending, so the candidate is not listed in the plugin's navigation.
+
+
+Recent-play history endpoint and callback behavior were checked against
+AkinoKaede/mygo-music-netease-cloud-music, commit
+`15e722d90d6d0921cab8f8153e27596130f099e1`, `src/recent.ts`
+(SPDX-FileCopyrightText: 2026 Kaede Akino; AGPL-3.0-or-later).
+The implementation here records only song IDs and timestamps when the host
+calls `played`, merges up to 100 local and remote songs, and batches details
+for current privileges. It does not upload listening events to NetEase.
+The host's `internal/player/player.go` and `internal/plugin/source.go` at the
+MyGo Music revision above define when `played` is called and the `recent`
+return contract. The custom discovery page and sidebar both expose this list.

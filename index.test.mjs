@@ -1219,6 +1219,10 @@ test("home links to podcast discovery reuse sized artwork without extra requests
   });
   const home = await plugin.home();
   const links = home.sections.flatMap((section) => section.links || []);
+  const recentLink = links.find(item => item.page === "recent");
+  assert.equal(recentLink.title, "最近播放");
+  assert.equal(new URL(recentLink.imageUrl).protocol, "https:");
+  assert.equal(new URL(recentLink.imageUrl).searchParams.get("param"), "{size}y{size}");
   for (const [page, index] of [["podcasts:recommend", 3], ["podcasts:hot:0", 4]]) {
     const link = links.find(item => item.page === page);
     assert.ok(link, page);
@@ -1560,4 +1564,49 @@ test("the sidebar has a visible recent page", async () => {
   const entry = manifest.navigation.find((item) => item.page === "recent");
   assert.ok(entry);
   assert.equal(entry.title, "最近播放");
+});
+
+// QR confirmation replaces the session object without changing its generation.
+// A history read begun during the scan must still be rejected after confirmation.
+test("recent rejects old details after QR confirmation in the same generation", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 10000 });
+  let finish;
+  const { plugin, storage } = await setup(async (url) => {
+    if (url.includes("/qrcode/unikey")) return response({ code: 200, unikey: "fixture-key" });
+    if (url.includes("/qrcode/client/login")) return response({ code: 803 }, ["MUSIC_U=synthetic-next; Path=/"]);
+    if (url.includes("/nuser/account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (url.includes("/play-record/song/list")) return response({ code: 200, data: { list: [{ data: song(1) }] } });
+    if (url.includes("/v3/song/detail")) return new Promise(resolve => { finish = resolve; });
+    throw new Error("Unexpected fixture request");
+  }, { cookies: { MUSIC_U: "synthetic-old" }, profile: { id: "7" } });
+  const login = plugin.signIn(); await flush();
+  const pending = plugin.recent(); await flush();
+  assert.equal(typeof finish, "function");
+  t.mock.timers.tick(1500); await flush(); await login;
+  finish(response({ code: 200, songs: [song(1)], privileges: [{ id: 1, st: 0, pl: 320000 }] }));
+  await assert.rejects(pending, /账号状态已改变/);
+  plugin.played({ id: "2" });
+  assert.deepEqual(storage.get("recent:8").map(item => item.id), ["2"]);
+  assert.equal(storage.has("recent:7"), false);
+});
+
+test("merged recent history stays at one hundred with overlapping and oversized service rows", async () => {
+  const { plugin } = await setup(async (_url, init) => {
+    const { path, data } = decode(init.body);
+    if (path === "/api/play-record/song/list") {
+      assert.equal(data.limit, 100);
+      return response({ code: 200, data: { list: Array.from({ length: 150 }, (_, i) => ({ data: song(i + 26) })) } });
+    }
+    assert.equal(path, "/api/v3/song/detail");
+    const ids = JSON.parse(data.c).map(item => item.id);
+    assert.equal(ids.length, 100);
+    return response({ code: 200, songs: ids.map(song), privileges: ids.map(id => ({ id, st: 0, pl: 320000 })) });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7" } });
+  for (let i = 1; i <= 50; i++) plugin.played({ id: String(i) });
+  const tracks = await plugin.recent();
+  assert.equal(tracks.length, 100);
+  assert.equal(new Set(tracks.map(item => item.id)).size, 100);
+  assert.equal(tracks[0].id, "50");
+  assert.equal(tracks[49].id, "1");
+  assert.equal(tracks.at(-1).id, "100");
 });
