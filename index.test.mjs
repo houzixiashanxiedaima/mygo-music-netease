@@ -3,9 +3,16 @@ import assert from "node:assert/strict";
 import { createCipheriv, createDecipheriv, createHash } from "node:crypto";
 
 let sequence = 0;
-const response = (body, cookies = []) => ({
-  ok: true, status: 200, json: async () => body, headers: { getSetCookie: () => cookies },
+const response = (body, cookies = [], headers = {}) => ({
+  ok: true, status: 200, json: async () => body,
+  headers: {
+    getSetCookie: () => cookies,
+    get: (name) => headers[String(name).toLowerCase()] ?? null,
+  },
 });
+// Mock timers replace setImmediate too; a microtask flush still lets the
+// fetch promise chain settle before the next tick.
+const flush = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
 
 async function setup(handler, savedSession) {
   const storage = new Map(savedSession ? [["session", structuredClone(savedSession)]] : []);
@@ -364,7 +371,8 @@ test("sign-out cancels a scheduled playback retry", async (t) => {
   let scheduled;
   const queued = new Promise(resolve => { scheduled = resolve; });
   t.mock.method(globalThis, "setTimeout", (fn, ms, ...args) => {
-    if (ms === 1000) { wake = fn; scheduled(); return 0; }
+    // The retry wait can be a millisecond less than the 2s cooldown.
+    if (ms >= 1000 && ms < 12000) { wake = fn; scheduled(); return 0; }
     return timer(fn, ms, ...args);
   });
   let calls = 0;
@@ -776,10 +784,16 @@ test("an account answer without a usable ID is neither cached nor a sign-out", a
 // Diagnostics are kept for reading later, so they are bounded and hold nothing
 // that could identify the listener or the audio.
 test("stream diagnostics stay bounded and leave out URLs and cookies", async () => {
-  const { plugin, storage } = await setup(async () => response({ code: 200, data: [
-    { id: 1, code: 200, url: "https://m1.music.126.net/song.mp3?token=audio%2Ftoken&expires=123", type: "mp3", level: "exhigh" },
-  ] }), { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
-  for (let i = 0; i < 25; i++) await plugin.stream({ id: "1" });
+  const { plugin, storage } = await setup(async (_url, init) => {
+    const { data } = decode(init.body);
+    const id = JSON.parse(data.ids)[0];
+    return response({ code: 200, data: [
+      { id, code: 200, url: "https://m1.music.126.net/song.mp3?token=audio%2Ftoken&expires=123", type: "mp3", level: "exhigh" },
+    ] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  // Distinct songs keep the cache from answering for the requests this test
+  // counts; the ring must still hold only the last 20 attempts.
+  for (let i = 1; i <= 25; i++) await plugin.stream({ id: String(i) });
   const log = storage.get("streamLog");
   assert.equal(log.length, 20);
   const saved = JSON.stringify(log);
@@ -788,7 +802,8 @@ test("stream diagnostics stay bounded and leave out URLs and cookies", async () 
   assert.ok(!saved.includes("https://"), saved);
   assert.deepEqual(Object.keys(log[0]).sort(), ["actual", "at", "code", "hasURL", "level", "outcome", "song", "trial"]);
   assert.deepEqual([log[0].song, log[0].level, log[0].code, log[0].hasURL, log[0].trial, log[0].actual],
-    ["1", "exhigh", 200, true, false, "exhigh"]);
+    ["6", "exhigh", 200, true, false, "exhigh"]);
+  assert.deepEqual([log.at(-1).song, log.at(-1).outcome], ["25", "ok"]);
 });
 
 // NetEase's immersive levels have no host name of their own. A lossless file
@@ -806,6 +821,280 @@ test("stream reports the quality the response proves", async () => {
     ] }));
     assert.equal((await plugin.stream({ id: "1", quality: "lossless" })).quality, quality, `${level} ${type}`);
   }
+});
+
+// Prefetch and the real play often ask for the same song within a moment. A
+// short cache may reuse that answer, but it must keep the quality the response
+// proved and must use the quality that was asked for as its key.
+test("stream reuses a brief successful source without relabelling a fallback", async () => {
+  const levels = [];
+  const { plugin, storage } = await setup(async (_url, init) => {
+    const { data } = decode(init.body);
+    const id = JSON.parse(data.ids)[0];
+    levels.push(data.level);
+    if (data.level === "lossless") {
+      return response({ code: 200, data: [{ id, url: null, code: 404, level: "lossless", freeTrialInfo: null }] });
+    }
+    return response({ code: 200, data: [
+      { id, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh" },
+    ] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const first = await plugin.stream({ id: "1", quality: "lossless" });
+  assert.equal(first.quality, "high");
+  const second = await plugin.stream({ id: "1", quality: "lossless" });
+  assert.deepEqual(second, first);
+  assert.deepEqual(levels, ["lossless", "exhigh"], "the cached answer is reused");
+  assert.deepEqual(storage.get("streamLog").map((entry) => [entry.level, entry.outcome, entry.hasURL]), [
+    ["lossless", "missing", false], ["exhigh", "ok", true], ["exhigh", "cached", true],
+  ]);
+  assert.ok(!JSON.stringify(storage.get("streamLog")).includes("https://"), "no URL in cached diagnostics");
+  // Another requested quality is another key, even for the same song.
+  await plugin.stream({ id: "1", quality: "high" });
+  assert.deepEqual(levels, ["lossless", "exhigh", "exhigh"]);
+  // So is another song.
+  await plugin.stream({ id: "2", quality: "lossless" });
+  assert.deepEqual(levels, ["lossless", "exhigh", "exhigh", "lossless", "exhigh"]);
+});
+
+// The reuse window is deliberately short: it joins a prefetch with its play,
+// not a listening session.
+test("stream stops reusing a source after the short cache window", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  let calls = 0;
+  const { plugin } = await setup(async () => {
+    calls++;
+    return response({ code: 200, data: [
+      { id: 1, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh" },
+    ] });
+  });
+  await plugin.stream({ id: "1" });
+  await plugin.stream({ id: "1" });
+  assert.equal(calls, 1);
+  t.mock.timers.tick(15000);
+  await plugin.stream({ id: "1" });
+  assert.equal(calls, 2);
+});
+
+// A cached source belongs to the session that asked for it.
+test("stream does not reuse a source across a session change", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async () => {
+    calls++;
+    return response({ code: 200, data: [
+      { id: 1, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh" },
+    ] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await plugin.stream({ id: "1" });
+  plugin.signOut();
+  await plugin.stream({ id: "1" });
+  assert.equal(calls, 2);
+});
+
+// The cache is bounded by song count, not only by time.
+test("stream bounds how many successful sources it keeps", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async (_url, init) => {
+    calls++;
+    const { data } = decode(init.body);
+    const id = JSON.parse(data.ids)[0];
+    return response({ code: 200, data: [
+      { id, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh" },
+    ] });
+  });
+  for (let i = 1; i <= 12; i++) await plugin.stream({ id: String(i) });
+  assert.equal(calls, 12);
+  await plugin.stream({ id: "1" });
+  assert.equal(calls, 12, "a recent answer is reused");
+  await plugin.stream({ id: "13" });
+  assert.equal(calls, 13);
+  await plugin.stream({ id: "1" });
+  assert.equal(calls, 14, "the oldest answer was released");
+  await plugin.stream({ id: "3" });
+  assert.equal(calls, 14, "a recent answer is still there");
+});
+
+// A refusal pauses the next source fetch. It must not serialize unrelated API
+// calls, and the wait must end inside the stream budget.
+test("a refusal cools down source fetches without blocking other APIs", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const requests = [];
+  const { plugin } = await setup(async (url) => {
+    requests.push(url);
+    if (url.includes("/song/enhance/player/url/v1")) return response({ code: -460 });
+    return response({ code: 200, result: [] });
+  });
+  const sourceCalls = () => requests.filter((url) => url.includes("/song/enhance/player/url/v1")).length;
+  const first = plugin.stream({ id: "1" }).then((value) => ({ value }), (error) => ({ error }));
+  await flush();
+  assert.equal(sourceCalls(), 1);
+  t.mock.timers.tick(2000);
+  await flush();
+  const firstOutcome = await first;
+  assert.match(firstOutcome.error.message, /仍拒绝播放请求（-460）/);
+  assert.equal(sourceCalls(), 2);
+  // An unrelated read answers while the cooldown is still active.
+  const before = requests.length;
+  await plugin.home();
+  assert.equal(requests.length, before + 1);
+  const second = plugin.stream({ id: "2" }).then((value) => ({ value }), (error) => ({ error }));
+  await flush();
+  assert.equal(sourceCalls(), 2, "no source request while cooling down");
+  t.mock.timers.tick(2000);
+  await flush();
+  assert.equal(sourceCalls(), 3);
+  t.mock.timers.tick(2000);
+  await flush();
+  const secondOutcome = await second;
+  assert.match(secondOutcome.error.message, /仍拒绝播放请求（-460）/);
+});
+
+// A request that hangs must stop before the host's 30s timeout. The budget
+// covers the request timeout, the cooldown and the second attempt.
+test("a hanging source request stops inside the stream budget", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let calls = 0;
+  const { plugin } = await setup(async (_url, init) => {
+    calls++;
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    });
+  });
+  const started = Date.now();
+  const playing = plugin.stream({ id: "1" }).then((value) => ({ value }), (error) => ({ error }));
+  await flush();
+  t.mock.timers.tick(12000);
+  await flush();
+  t.mock.timers.tick(2000);
+  await flush();
+  t.mock.timers.tick(11000);
+  await flush();
+  const outcome = await playing;
+  assert.match(outcome.error.message, /等待预算/);
+  assert.equal(calls, 2);
+  assert.equal(Date.now() - started, 25000);
+});
+
+// A Retry-After is a server instruction, not a suggestion: wait at least that
+// long, and never retry earlier just to turn a refusal into a success.
+test("stream honors a valid Retry-After beyond its own cooldown", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let calls = 0;
+  const { plugin } = await setup(async () => {
+    calls++;
+    if (calls === 1) {
+      return {
+        ok: false, status: 429, json: async () => ({}),
+        headers: { getSetCookie: () => [], get: (name) => String(name).toLowerCase() === "retry-after" ? "3" : null },
+      };
+    }
+    return response({ code: 200, data: [
+      { id: 1, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh" },
+    ] });
+  });
+  const playing = plugin.stream({ id: "1" });
+  await flush();
+  assert.equal(calls, 1);
+  t.mock.timers.tick(2999);
+  await flush();
+  assert.equal(calls, 1, "waited for Retry-After, not the 2s cooldown");
+  t.mock.timers.tick(1);
+  await flush();
+  assert.equal((await playing).type, "mp3");
+  assert.equal(calls, 2);
+});
+
+// If the server asks for more time than this call can spend, stop inside the
+// budget instead of retrying early.
+test("stream stops instead of retrying before an unaffordable Retry-After", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async () => {
+    calls++;
+    return {
+      ok: false, status: 429, json: async () => ({}),
+      headers: { getSetCookie: () => [], get: (name) => String(name).toLowerCase() === "retry-after" ? "60" : null },
+    };
+  });
+  await assert.rejects(plugin.stream({ id: "1" }), /要求等待 60 秒/);
+  assert.equal(calls, 1);
+});
+
+// A check that could not finish says nothing about the login. Its "no answer"
+// must not be cached as a reusable answer for the next 401.
+test("an unfinished account check is not reused by the next 401", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let probes = 0;
+  const { plugin, storage } = await setup(async (url, init) => {
+    if (url.includes("/api/nuser/account/get")) {
+      probes++;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }
+    return response({ code: 401 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const first = plugin.stream({ id: "1" }).then((value) => ({ value }), (error) => ({ error }));
+  await flush();
+  t.mock.timers.tick(10000);
+  await flush();
+  const firstOutcome = await first;
+  assert.equal(firstOutcome.error.code, "unavailable");
+  assert.equal(probes, 1);
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  const second = plugin.stream({ id: "2" }).then((value) => ({ value }), (error) => ({ error }));
+  await flush();
+  t.mock.timers.tick(10000);
+  await flush();
+  const secondOutcome = await second;
+  assert.equal(secondOutcome.error.code, "unavailable");
+  assert.equal(probes, 2);
+});
+
+// One caller's budget must not cancel the account check that another caller is
+// still waiting for. The check has its own timeout and keeps running.
+test("one waiter's budget does not cancel a shared account check", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let probes = 0;
+  let source = 0;
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("/api/nuser/account/get")) {
+      probes++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(response(ACCOUNT_OK)), 10000);
+        init.signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("aborted")); }, { once: true });
+      });
+    }
+    source++;
+    if (source === 1) {
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }
+    if (source === 2) {
+      return new Promise((resolve) => {
+        setTimeout(() => resolve(response({ code: 401 })), 2000);
+      });
+    }
+    return response({ code: 401 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const a = plugin.stream({ id: "1" }).then((value) => ({ value }), (error) => ({ error }));
+  await flush();
+  t.mock.timers.tick(12000);
+  await flush();
+  t.mock.timers.tick(2000);
+  await flush();
+  t.mock.timers.tick(2000);
+  await flush();
+  const b = plugin.stream({ id: "2" }).then((value) => ({ value }), (error) => ({ error }));
+  await flush();
+  t.mock.timers.tick(9000);
+  await flush();
+  const aOutcome = await a;
+  assert.match(aOutcome.error.message, /等待预算/);
+  t.mock.timers.tick(1000);
+  await flush();
+  const bOutcome = await b;
+  assert.equal(bOutcome.error.code, "unavailable");
+  assert.equal(probes, 1, "the shared check was not restarted or cancelled");
 });
 
 test("suggest ignores malformed and unknown groups without breaking valid candidates", async () => {

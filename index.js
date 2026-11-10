@@ -25,6 +25,23 @@ const QUALITY_NAMES = { standard: "标准音质", high: "高音质", lossless: "
 // One request, and one retry of a failure that may have been a moment's.
 const STREAM_ATTEMPTS = 2;
 const STREAM_RETRY_MS = 1000;
+// Requests that share this plugin's fetch path keep a hard timeout. The stream
+// path shortens it to the time left in its own budget.
+const REQUEST_TIMEOUT_MS = 12000;
+// A refused source request says the next one should not leave immediately:
+// NetEase prefetch and the real play often ask back to back.
+const STREAM_COOLDOWN_MS = 2000;
+// Reuse a successful source only long enough to join a prefetch with the play
+// that follows it. The host already caches the audio itself.
+const STREAM_CACHE_TTL_MS = 15000;
+const STREAM_CACHE_LIMIT = 12;
+// MyGo stops a plugin call after 30 seconds. Keep cooldown, retries and the
+// account check inside this budget so the host still has room to react.
+const STREAM_BUDGET_MS = 25000;
+// A shared account check must finish on its own, not on the budget of whichever
+// 401 happened to start it. A waiter with less time stops waiting; the check
+// keeps running for the other callers.
+const PROBE_TIMEOUT_MS = 10000;
 // The last attempts kept for reading later, as a ring.
 const DIAGNOSTIC_LIMIT = 20;
 // A content 401 does not prove the login expired. One account check answers
@@ -43,6 +60,12 @@ let likedCache = null;
 let probeRecord = null;
 let probeRun = null;
 const pendingStreams = new Map();
+// Shared by every stream request: a refusal pauses the next source fetch, but
+// never an unrelated API call.
+let streamCooldownUntil = 0;
+// Short reuse of a successful source, keyed by session, song and the quality
+// that was asked for. The value keeps the quality the response proved.
+const streamCache = new Map();
 let discoveryCovers = null;
 let heartState = null;
 let pendingHeart = null;
@@ -62,10 +85,19 @@ function fail(code, message) {
 // server error. Nothing else is marked, so a missing source is never retried
 // as if waiting would fix it, and a moment's failure is never answered by
 // asking for a lower quality.
-function transientFailure(message, neteaseCode) {
+function transientFailure(message, neteaseCode, retryAfterMs) {
   const error = new Error(message);
   error.transient = true;
   if (neteaseCode !== undefined) error.neteaseCode = neteaseCode;
+  if (retryAfterMs > 0) error.retryAfterMs = retryAfterMs;
+  return error;
+}
+
+// A deadline is not a server answer: stopping here keeps the host's own
+// timeout out of play, and never turns a wait into a different quality.
+function deadlineFailure(message = "网易云取源已用完本次等待预算，请稍后重试") {
+  const error = new Error(message);
+  error.deadline = true;
   return error;
 }
 
@@ -85,12 +117,26 @@ function transientCode(code) {
   return code === 429 || (code >= 500 && code <= 599);
 }
 
-function httpFailure(status) {
+function httpFailure(status, retryAfterMs) {
   const error = new Error(`网易云请求失败（HTTP ${status}）`);
   error.transient = status >= 500 || status === 429;
   // Record the status for the diagnostics. Retry policy stays as it was.
   error.neteaseCode = status;
+  if (retryAfterMs > 0) error.retryAfterMs = retryAfterMs;
   return error;
+}
+
+// Retry-After is either delta-seconds or an HTTP-date. Anything else is not a
+// usable instruction and must not become a guessed wait.
+function retryAfterDelay(headers) {
+  if (!headers || typeof headers.get !== "function") return 0;
+  let value;
+  try { value = headers.get("retry-after"); } catch { return 0; }
+  if (typeof value !== "string" || !value.trim()) return 0;
+  const text = value.trim();
+  if (/^\d+$/.test(text)) return Number(text) * 1000;
+  const at = Date.parse(text);
+  return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0;
 }
 
 function idOf(value) {
@@ -184,6 +230,8 @@ function clearSession() {
   probeRun = null;
   likedCache = null;
   pendingStreams.clear();
+  // A source cached for the old session must never answer for the next one.
+  streamCache.clear();
   heartState = null;
   pendingHeart = null;
   host.storage.remove("session");
@@ -242,15 +290,22 @@ async function request(path, params = {}, options = {}) {
     if (cookie) headers.Cookie = cookie;
   }
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+  // A stream request may carry an absolute deadline. Never wait past it, and
+  // never let the shared 12s timeout consume budget that is already gone.
+  const remaining = options.deadline === undefined ? REQUEST_TIMEOUT_MS : options.deadline - Date.now();
+  if (remaining <= 0) throw deadlineFailure();
+  const timer = setTimeout(() => controller.abort(), Math.min(REQUEST_TIMEOUT_MS, remaining));
   init.signal = controller.signal;
   let response, body;
   try {
     response = await fetch(url, init);
-    if (!response.ok) throw httpFailure(response.status);
+    if (!response.ok) throw httpFailure(response.status, retryAfterDelay(response.headers));
     body = await response.json();
   } catch (error) {
-    if (controller.signal.aborted) throw transientFailure("网易云请求超时，请稍后重试");
+    if (controller.signal.aborted) {
+      if (options.deadline !== undefined && Date.now() >= options.deadline) throw deadlineFailure();
+      throw transientFailure("网易云请求超时，请稍后重试");
+    }
     // Never put response bodies, request headers or login cookies in errors.
     if (response && !response.ok) throw error;
     throw transientFailure("无法读取网易云音乐，请检查网络及系统代理后重试");
@@ -261,6 +316,7 @@ async function request(path, params = {}, options = {}) {
   if (!body || typeof body !== "object") throw new Error("网易云返回了无效数据");
   const code = Number(body.code);
   const allowed = options.codes || [200];
+  const retryAfter = retryAfterDelay(response.headers);
   // A read-only request never answers with a cookie update: it asks a question
   // and leaves the session exactly as it found it.
   const readOnly = !!options.readOnly;
@@ -271,7 +327,7 @@ async function request(path, params = {}, options = {}) {
     if (code === 401) {
       if (readOnly) throw fail("unavailable", "当前账号无权访问该内容");
       acceptResponseCookies(response, activeSession, { persist: false, signOut: false });
-      if (await sessionExpired(activeSession, startedEpoch)) {
+      if (await sessionExpired(activeSession, startedEpoch, options.deadline)) {
         if (activeSession === session && startedEpoch === epoch) clearSession();
         throw fail("signIn", "请重新登录网易云音乐");
       }
@@ -285,14 +341,14 @@ async function request(path, params = {}, options = {}) {
       // A refused response can still renew NMTID. Keep the server's cookie
       // update for the same device/account retry, including session expiry.
       if (!readOnly) acceptResponseCookies(response, activeSession);
-      throw transientFailure(`网易云暂时拒绝了请求（${code}），请稍后重试`, code);
+      throw transientFailure(`网易云暂时拒绝了请求（${code}），请稍后重试`, code, retryAfter);
     }
-    if (code === 405) throw transientFailure("网易云暂时限制了请求，请稍后再试", 405);
+    if (code === 405) throw transientFailure("网易云暂时限制了请求，请稍后再试", 405, retryAfter);
     // Throttling and server errors travel as a top-level code too. Mark them
     // transient exactly like the 460 above, keep the number, and let the caller
     // retry at the same level: a moment's failure is never a lower quality.
     if (transientCode(code)) {
-      throw transientFailure(`网易云暂时无法返回结果（${code}），请稍后重试`, code);
+      throw transientFailure(`网易云暂时无法返回结果（${code}），请稍后重试`, code, retryAfter);
     }
     // An unlisted code keeps its number for the diagnostics and its current
     // handling: it is not marked transient, so no new retry and no lower level.
@@ -305,10 +361,25 @@ async function request(path, params = {}, options = {}) {
 }
 
 // One account check answers every content 401 for the next SESSION_PROBE_MS.
-// Concurrent refusals share the check that is already running; the finished
-// check is released by identity, so the window really expires and a later
-// expiry is checked again instead of reusing the first answer.
-async function sessionExpired(activeSession, generation) {
+// Wait for a shared promise only as long as this caller's budget allows. The
+// promise itself keeps running: one caller running out of time must not cancel
+// a check that another caller is still waiting for.
+function beforeDeadline(promise, deadline) {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(deadlineFailure());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(deadlineFailure()), remaining);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+async function sessionExpired(activeSession, generation, deadline) {
+  // Concurrent refusals share the check that is already running; the finished
+  // check is released by identity, so the window really expires and a later
+  // expiry is checked again instead of reusing the first answer.
   const saved = probeRecord;
   // A cached answer belongs to the credential it was asked with: once the
   // cookie is gone, the answer no longer describes this session.
@@ -316,34 +387,39 @@ async function sessionExpired(activeSession, generation) {
       Date.now() - saved.at < SESSION_PROBE_MS && activeSession.cookies.MUSIC_U) {
     return saved.expired;
   }
-  if (!probeRun || probeRun.session !== activeSession || probeRun.generation !== generation) {
-    const pending = { session: activeSession, generation, promise: probeSession(activeSession, generation) };
-    probeRun = pending;
-    try {
-      return await pending.promise;
-    } finally {
-      if (probeRun === pending) probeRun = null;
-    }
+  if (deadline !== undefined && deadline <= Date.now()) throw deadlineFailure();
+  let pending = probeRun;
+  if (!pending || pending.session !== activeSession || pending.generation !== generation) {
+    const run = { session: activeSession, generation };
+    run.promise = probeSession(activeSession, generation).finally(() => {
+      // Release by identity so a later expiry starts a fresh check.
+      if (probeRun === run) probeRun = null;
+    });
+    pending = run;
+    probeRun = run;
   }
-  return probeRun.promise;
+  const answer = deadline === undefined ? await pending.promise : await beforeDeadline(pending.promise, deadline);
+  return answer === true;
 }
 
 async function probeSession(activeSession, generation) {
-  let expired = false;
+  let expired;
   try {
     // profileFor is read-only here: a check that cannot finish changes nothing.
-    expired = !(await profileFor(activeSession, { readOnly: true }));
+    // Give the shared check its own timeout, not the first waiter's budget.
+    expired = !(await profileFor(activeSession, {
+      readOnly: true, deadline: Date.now() + PROBE_TIMEOUT_MS,
+    }));
   } catch {
     // A timeout, a network error, a 460, or an answer without a usable account
-    // says nothing about the login. Only a success without a profile proves
-    // the session no longer has an account.
-    expired = false;
+    // says nothing about the login. Do not cache it: another 401 must be able
+    // to ask again instead of reusing an unfinished answer.
+    return null;
   }
   // A check that finished after the session or the generation changed must not
   // answer for whichever session is current now.
-  if (activeSession === session && generation === epoch) {
-    probeRecord = { session: activeSession, generation, at: Date.now(), expired };
-  }
+  if (activeSession !== session || generation !== epoch) return null;
+  probeRecord = { session: activeSession, generation, at: Date.now(), expired };
   return expired;
 }
 
@@ -960,25 +1036,92 @@ export async function lyrics({ id }) {
   return { lrc: desktop.lrc?.lyric || "", translation: desktop.tlyric?.lyric || translation };
 }
 
+// A successful source is kept for a very short window, keyed by the session,
+// the song and the quality that was asked for. The result keeps the quality
+// the response proved, so a fallback is never relabelled as the request.
+function cachedStream(key) {
+  const entry = streamCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at >= STREAM_CACHE_TTL_MS) {
+    streamCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function rememberStream(key, result, diagnostic, generation) {
+  // A session change while the request was in flight makes this answer belong
+  // to the previous session. Never let it answer for the current one.
+  if (generation !== epoch) return;
+  // NetEase's URL record has no expiry field with documented units, so none is
+  // interpreted here. The TTL is short and only complete, non-trial sources
+  // are stored: a result the server calls shorter than this window is not put
+  // in the cache at all.
+  streamCache.set(key, {
+    at: Date.now(),
+    result: { ...result, headers: { ...result.headers } },
+    diagnostic: { ...diagnostic },
+  });
+  while (streamCache.size > STREAM_CACHE_LIMIT) {
+    streamCache.delete(streamCache.keys().next().value);
+  }
+}
+
+function coolDownStreams() {
+  streamCooldownUntil = Math.max(streamCooldownUntil, Date.now() + STREAM_COOLDOWN_MS);
+}
+
+async function waitForStreamCooldown(deadline, minimumDelay = 0) {
+  const target = Math.max(streamCooldownUntil, Date.now() + minimumDelay);
+  const delay = target - Date.now();
+  if (delay <= 0) return;
+  const left = deadline - Date.now();
+  if (left <= 0) throw deadlineFailure();
+  await new Promise(resolve => setTimeout(resolve, Math.min(delay, left)));
+  if (Date.now() >= deadline) throw deadlineFailure();
+}
+
+async function waitForStreamRetry(error, deadline) {
+  const left = deadline - Date.now();
+  if (left <= 0) throw deadlineFailure();
+  // A server that names a wait longer than this call can afford is not an
+  // invitation to retry early: say so and stop inside the budget.
+  if (error.retryAfterMs > left) {
+    throw deadlineFailure(`网易云要求等待 ${Math.ceil(error.retryAfterMs / 1000)} 秒，超过本次取源预算，请稍后重试`);
+  }
+  await waitForStreamCooldown(deadline, Math.max(STREAM_RETRY_MS, error.retryAfterMs || 0));
+}
+
 export async function stream({ id, quality = "high" }) {
   id = trackIdentity(id).audio;
   if (!id) throw fail("unavailable", "该播客节目没有可播放的音频");
   const activeSession = currentSession();
   const generation = epoch;
-  const key = `${generation}:${id}:${quality}`;
+  const asked = STREAM_LEVELS[quality] ? quality : "high";
+  const key = `${generation}:${id}:${asked}`;
+  const cached = cachedStream(key);
+  if (cached) {
+    // Reuse is worth recording, but it is still just fields: no URL, no query.
+    rememberStreamDiagnostics([{ ...cached.diagnostic, at: new Date().toISOString(), outcome: "cached" }]);
+    return { ...cached.result, headers: { ...cached.result.headers } };
+  }
   if (pendingStreams.has(key)) return pendingStreams.get(key);
-  const pending = loadStream(id, quality, generation, activeSession);
+  const deadline = Date.now() + STREAM_BUDGET_MS;
+  const pending = loadStream(id, asked, generation, activeSession, deadline, key);
   pendingStreams.set(key, pending);
   try { return await pending; }
   finally { if (pendingStreams.get(key) === pending) pendingStreams.delete(key); }
 }
 
-async function loadStream(id, quality, generation, activeSession) {
+async function loadStream(id, quality, generation, activeSession, deadline, cacheKey) {
   const records = [];
   const tried = [];
   let missing = "";
   try {
-    for (let ask = STREAM_LEVELS[quality] ? quality : "high"; ask; ask = LOWER_QUALITY[ask]) {
+    // A refusal pauses the next source fetch. The first call made while a
+    // cooldown is active still waits, but unrelated APIs never do.
+    await waitForStreamCooldown(deadline);
+    for (let ask = quality; ask; ask = LOWER_QUALITY[ask]) {
       const level = STREAM_LEVELS[ask];
       tried.push(QUALITY_NAMES[ask]);
       for (let attempt = 1; ; attempt++) {
@@ -987,10 +1130,11 @@ async function loadStream(id, quality, generation, activeSession) {
         try {
           data = await eapi("/api/song/enhance/player/url/v1", {
             ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
-          });
+          }, { deadline });
         } catch (error) {
           records.push(streamDiagnostic(id, level, error.transient ? "transient" : "error", null, error.neteaseCode));
-          if (!error.transient) throw error;
+          if (error.deadline || !error.transient) throw error;
+          coolDownStreams();
           if (attempt >= STREAM_ATTEMPTS) {
             // Still refused at the quality asked for, so this song may play
             // later: say that, and never turn a refusal into a lower level.
@@ -999,7 +1143,7 @@ async function loadStream(id, quality, generation, activeSession) {
             }
             throw error;
           }
-          await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+          await waitForStreamRetry(error, deadline);
           continue;
         }
         const audio = (data.data || []).find((item) => String(item.id) === id);
@@ -1007,8 +1151,9 @@ async function loadStream(id, quality, generation, activeSession) {
           // A success without this song's record is a soft refusal or a moment
           // of the service, not proof that the account may not play it.
           records.push(streamDiagnostic(id, level, "empty", null, data.code));
+          coolDownStreams();
           if (attempt < STREAM_ATTEMPTS) {
-            await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+            await waitForStreamCooldown(deadline, STREAM_RETRY_MS);
             continue;
           }
           throw new Error("网易云未返回这首歌的音源，请稍后重试");
@@ -1022,8 +1167,9 @@ async function loadStream(id, quality, generation, activeSession) {
         }
         if ([460, -460].includes(code)) {
           records.push(streamDiagnostic(id, level, "transient", audio, code));
+          coolDownStreams();
           if (attempt < STREAM_ATTEMPTS) {
-            await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+            await waitForStreamCooldown(deadline, STREAM_RETRY_MS);
             continue;
           }
           throw new Error(`网易云仍拒绝播放请求（${code}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
@@ -1033,7 +1179,15 @@ async function loadStream(id, quality, generation, activeSession) {
           // ended login. Ask the account, read-only, as the top-level 401 does,
           // instead of deciding from the number. No lower level can answer it.
           records.push(streamDiagnostic(id, level, "denied", audio, code));
-          if (await sessionExpired(activeSession, generation)) {
+          let expired = false;
+          try {
+            expired = await sessionExpired(activeSession, generation, deadline);
+          } catch (error) {
+            // This caller's budget ended while waiting. The shared check keeps
+            // running for other callers; this one stops without acting on it.
+            if (error.deadline) throw error;
+          }
+          if (expired) {
             if (activeSession === session && generation === epoch) clearSession();
             throw fail("signIn", "请重新登录网易云音乐");
           }
@@ -1047,8 +1201,9 @@ async function loadStream(id, quality, generation, activeSession) {
           // Throttling and server errors say nothing about this level either:
           // answer them the way a failed request is answered, at the same level.
           records.push(streamDiagnostic(id, level, "transient", audio, code));
+          coolDownStreams();
           if (attempt < STREAM_ATTEMPTS) {
-            await new Promise(resolve => setTimeout(resolve, STREAM_RETRY_MS));
+            await waitForStreamCooldown(deadline, STREAM_RETRY_MS);
             continue;
           }
           throw new Error(`网易云暂时无法返回音源（${code}），请稍后重试`);
@@ -1077,12 +1232,15 @@ async function loadStream(id, quality, generation, activeSession) {
           records.push(streamDiagnostic(id, level, "error", audio, code));
           throw fail("unavailable", "该歌曲的音频格式暂不支持");
         }
-        records.push(streamDiagnostic(id, level, "ok", audio, code));
-        return {
+        const diagnostic = streamDiagnostic(id, level, "ok", audio, code);
+        records.push(diagnostic);
+        const result = {
           url: url.toString(), type, size: audio.size || 0, bitRate: audio.br || 0,
           quality: streamQuality(audio), gain: audio.gain || 0, peak: audio.peak || 0,
           headers: { "User-Agent": UA, Referer: `${SITE}/` },
         };
+        rememberStream(cacheKey, result, diagnostic, generation);
+        return result;
       }
     }
     throw fail("unavailable", missing || "当前账号无完整播放权限，或歌曲在当前地区不可用");
