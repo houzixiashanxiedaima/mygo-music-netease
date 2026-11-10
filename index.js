@@ -651,8 +651,8 @@ export async function home() {
         { title: "个性化歌单", subtitle: "网易云为你推荐的歌单", page: "recommendations", imageUrl: discoveryCover(2) },
       ] },
       { title: "播客发现", links: [
-        { title: "推荐播客", subtitle: "网易云为你推荐的播客", page: "podcasts:recommend" },
-        { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0" },
+        { title: "推荐播客", subtitle: "网易云为你推荐的播客", page: "podcasts:recommend", imageUrl: discoveryCover(3) },
+        { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0", imageUrl: discoveryCover(4) },
       ] },
       { title: "私人漫游", stations: stationList() },
       recommendations,

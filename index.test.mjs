@@ -850,17 +850,25 @@ test("guests can discover entries but private recommendations ask for sign-in", 
 
 // Discovery links keep Home to one request; the podcast pages load only when
 // the listener opens them.
-test("home links to podcast discovery without loading its shows", async () => {
+test("home links to podcast discovery reuse sized artwork without extra requests", async () => {
   let calls = 0;
   const { plugin } = await setup(async (url) => {
     calls++;
     assert.ok(url.includes("/api/personalized/playlist"));
-    return response({ code: 200, result: [] });
+    return response({ code: 200, result: Array.from({ length: 5 }, (_, id) => ({
+      id: id + 1, name: `Discovery ${id}`, picUrl: `http://p2.music.126.net/discovery-${id}.jpg`,
+    })) });
   });
   const home = await plugin.home();
   const links = home.sections.flatMap((section) => section.links || []);
-  assert.ok(links.some((link) => link.page === "podcasts:recommend"));
-  assert.ok(links.some((link) => link.page === "podcasts:hot:0"));
+  for (const [page, index] of [["podcasts:recommend", 3], ["podcasts:hot:0", 4]]) {
+    const link = links.find(item => item.page === page);
+    assert.ok(link, page);
+    const cover = new URL(link.imageUrl);
+    assert.equal(cover.protocol, "https:");
+    assert.equal(cover.pathname, `/discovery-${index}.jpg`);
+    assert.equal(cover.searchParams.get("param"), "{size}y{size}");
+  }
   assert.equal(calls, 1);
 });
 
