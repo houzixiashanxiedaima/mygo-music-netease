@@ -272,6 +272,12 @@ async function request(path, params = {}, options = {}) {
       throw transientFailure(`网易云暂时拒绝了请求（${code}），请稍后重试`, code);
     }
     if (code === 405) throw transientFailure("网易云暂时限制了请求，请稍后再试", 405);
+    // Throttling and server errors travel as a top-level code too. Mark them
+    // transient exactly like the 460 above, keep the number, and let the caller
+    // retry at the same level: a moment's failure is never a lower quality.
+    if (transientCode(code)) {
+      throw transientFailure(`网易云暂时无法返回结果（${code}），请稍后重试`, code);
+    }
     // An unlisted code keeps its number for the diagnostics and its current
     // handling: it is not marked transient, so no new retry and no lower level.
     const unexpected = new Error(`网易云接口返回错误（${Number.isFinite(code) ? code : "未知"}）`);
@@ -975,10 +981,14 @@ async function loadStream(id, quality, generation, activeSession) {
 // answers later lossless requests with it.
 function streamQuality(audio) {
   const level = String(audio.level || "").toLowerCase();
+  const type = String(audio.type || "").toLowerCase();
+  // A known lossy container never proves lossless, whatever the level claims.
+  const lossy = type === "mp3" || type === "ogg";
   if (level === "standard") return "standard";
+  if (lossy) return "high";
   if (["lossless", "hires"].includes(level)) return "lossless";
   if (["higher", "exhigh"].includes(level)) return "high";
-  return String(audio.type || "").toLowerCase() === "flac" ? "lossless" : "high";
+  return type === "flac" ? "lossless" : "high";
 }
 
 // One line per attempt, with what tells a refusal from a missing level and a

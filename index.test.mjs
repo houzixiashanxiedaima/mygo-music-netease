@@ -684,14 +684,37 @@ test("an unlisted stream result stops at the level asked and keeps its number", 
   }
 });
 
-// The top-level 405, a failed HTTP request, and an unlisted JSON code must all
+// A top-level throttle or server error code is a moment's failure, not a
+// missing level: retry once at the quality asked for, keep the number, and
+// never fall back to a lower quality.
+test("stream retries a top-level 429 or 5xx code at the same level", async () => {
+  for (const code of [429, 500, 503, 599]) {
+    const levels = [];
+    const { plugin, storage } = await setup(async (_url, init) => {
+      levels.push(decode(init.body).data.level);
+      return response({ code });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), (error) => {
+      assert.equal(error.neteaseCode, code, String(code));
+      assert.equal(error.transient, true, String(code));
+      return true;
+    });
+    assert.deepEqual(levels, ["lossless", "lossless"], String(code));
+    assert.deepEqual(storage.get("streamLog").map(entry => [entry.level, entry.outcome, entry.code]), [
+      ["lossless", "transient", code], ["lossless", "transient", code],
+    ], String(code));
+  }
+});
+
+// The top-level 405, a failed HTTP request, and a transient JSON code must all
 // leave their number in the diagnostics. Only the already-transient ones are
 // retried: recording a code must not widen the retry policy.
 test("stream diagnostics record the code of a top-level refusal or HTTP failure", async () => {
   for (const [answer, code, attempts, outcome] of [
     [() => response({ code: 405 }), 405, 2, "transient"],
     [() => ({ ok: false, status: 502, json: async () => ({}), headers: { getSetCookie: () => [] } }), 502, 2, "transient"],
-    [() => response({ code: 503 }), 503, 1, "error"],
+    [() => response({ code: 503 }), 503, 2, "transient"],
+    [() => response({ code: 402 }), 402, 1, "error"],
   ]) {
     let calls = 0;
     const { plugin, storage } = await setup(async () => { calls++; return answer(); },
@@ -742,6 +765,8 @@ test("stream reports the quality the response proves", async () => {
   for (const [level, type, quality] of [
     ["jymaster", "flac", "lossless"], ["sky", "flac", "lossless"], ["jymaster", "mp3", "high"],
     [undefined, "flac", "lossless"], [undefined, "mp3", "high"], ["hires", "flac", "lossless"],
+    // A known lossy container outranks the level name it came with.
+    ["lossless", "mp3", "high"], ["hires", "ogg", "high"],
   ]) {
     const { plugin } = await setup(async () => response({ code: 200, data: [
       { id: 1, code: 200, url: "https://m1.music.126.net/song", type, level },
