@@ -65,6 +65,15 @@ function transientFailure(message, neteaseCode) {
   return error;
 }
 
+// A refusal this plugin does not classify further. Keep the number so the
+// diagnostic names it, and keep the session: one layer's code is not proof
+// that the login ended.
+function neteaseRefusal(neteaseCode, message) {
+  const error = new Error(message);
+  error.neteaseCode = neteaseCode;
+  return error;
+}
+
 // The same moment of refusal also arrives inside a song's record when the
 // transport succeeded. Another level asks the same server for the same song,
 // so only waiting can change this answer.
@@ -75,6 +84,8 @@ function transientCode(code) {
 function httpFailure(status) {
   const error = new Error(`网易云请求失败（HTTP ${status}）`);
   error.transient = status >= 500 || status === 429;
+  // Record the status for the diagnostics. Retry policy stays as it was.
+  error.neteaseCode = status;
   return error;
 }
 
@@ -260,22 +271,37 @@ async function request(path, params = {}, options = {}) {
       if (!readOnly) acceptResponseCookies(response, activeSession);
       throw transientFailure(`网易云暂时拒绝了请求（${code}），请稍后重试`, code);
     }
-    if (code === 405) throw transientFailure("网易云暂时限制了请求，请稍后再试");
-    throw new Error(`网易云接口返回错误（${Number.isFinite(code) ? code : "未知"}）`);
+    if (code === 405) throw transientFailure("网易云暂时限制了请求，请稍后再试", 405);
+    // An unlisted code keeps its number for the diagnostics and its current
+    // handling: it is not marked transient, so no new retry and no lower level.
+    const unexpected = new Error(`网易云接口返回错误（${Number.isFinite(code) ? code : "未知"}）`);
+    if (Number.isFinite(code)) unexpected.neteaseCode = code;
+    throw unexpected;
   }
   if (!readOnly) acceptResponseCookies(response, activeSession);
   return body;
 }
 
 // One account check answers every content 401 for the next SESSION_PROBE_MS.
-// Concurrent refusals share the check that is already running.
-function sessionExpired(activeSession, generation) {
+// Concurrent refusals share the check that is already running; the finished
+// check is released by identity, so the window really expires and a later
+// expiry is checked again instead of reusing the first answer.
+async function sessionExpired(activeSession, generation) {
   const saved = probeRecord;
-  if (saved && saved.generation === generation && Date.now() - saved.at < SESSION_PROBE_MS) {
-    return Promise.resolve(saved.expired);
+  // A cached answer belongs to the credential it was asked with: once the
+  // cookie is gone, the answer no longer describes this session.
+  if (saved && saved.session === activeSession && saved.generation === generation &&
+      Date.now() - saved.at < SESSION_PROBE_MS && activeSession.cookies.MUSIC_U) {
+    return saved.expired;
   }
-  if (!probeRun || probeRun.generation !== generation) {
-    probeRun = { generation, promise: probeSession(activeSession, generation) };
+  if (!probeRun || probeRun.session !== activeSession || probeRun.generation !== generation) {
+    const pending = { session: activeSession, generation, promise: probeSession(activeSession, generation) };
+    probeRun = pending;
+    try {
+      return await pending.promise;
+    } finally {
+      if (probeRun === pending) probeRun = null;
+    }
   }
   return probeRun.promise;
 }
@@ -286,11 +312,16 @@ async function probeSession(activeSession, generation) {
     // profileFor is read-only here: a check that cannot finish changes nothing.
     expired = !(await profileFor(activeSession, { readOnly: true }));
   } catch {
-    // A timeout, a network error or 460 says nothing about the login. Only a
-    // success without a profile proves the session no longer has an account.
+    // A timeout, a network error, a 460, or an answer without a usable account
+    // says nothing about the login. Only a success without a profile proves
+    // the session no longer has an account.
     expired = false;
   }
-  if (generation === epoch) probeRecord = { generation, at: Date.now(), expired };
+  // A check that finished after the session or the generation changed must not
+  // answer for whichever session is current now.
+  if (activeSession === session && generation === epoch) {
+    probeRecord = { session: activeSession, generation, at: Date.now(), expired };
+  }
   return expired;
 }
 
@@ -401,12 +432,21 @@ async function songDetails(ids, originals = [], options = {}) {
 
 async function profileFor(activeSession, options = {}) {
   const data = await request("/api/nuser/account/get", {}, { session: activeSession, ...options });
-  const profile = activeSession.cookies.MUSIC_U ? data.profile : null;
-  return profile ? { id: String(profile.userId), name: profile.nickname, imageUrl: artworkURL(profile.avatarUrl) } : null;
+  // The cookie is the account: an in-memory deletion means this session has no
+  // account left, however the endpoint answers the request it carried.
+  if (!activeSession.cookies.MUSIC_U) return null;
+  const profile = data.profile;
+  if (!profile) return null;
+  const id = Number(profile.userId);
+  // An answer without a usable account ID is neither an account nor proof that
+  // the login ended. Report it as an error: never cache it, never act on it.
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error("网易云未返回有效的账号信息");
+  return { id: String(id), name: profile.nickname || "", imageUrl: artworkURL(profile.avatarUrl) };
 }
 
 export async function account() {
   const activeSession = currentSession();
+  // A cached profile belongs to a session that still holds its credential.
   if (!activeSession.cookies.MUSIC_U) return null;
   if (activeSession.profile && Date.now() - profileCheckedAt < 60000) return activeSession.profile;
   try {
@@ -801,16 +841,17 @@ export async function lyrics({ id }) {
 export async function stream({ id, quality = "high" }) {
   id = trackIdentity(id).audio;
   if (!id) throw fail("unavailable", "该播客节目没有可播放的音频");
+  const activeSession = currentSession();
   const generation = epoch;
   const key = `${generation}:${id}:${quality}`;
   if (pendingStreams.has(key)) return pendingStreams.get(key);
-  const pending = loadStream(id, quality, generation);
+  const pending = loadStream(id, quality, generation, activeSession);
   pendingStreams.set(key, pending);
   try { return await pending; }
   finally { if (pendingStreams.get(key) === pending) pendingStreams.delete(key); }
 }
 
-async function loadStream(id, quality, generation) {
+async function loadStream(id, quality, generation, activeSession) {
   const records = [];
   const tried = [];
   let missing = "";
@@ -865,7 +906,18 @@ async function loadStream(id, quality, generation) {
           }
           throw new Error(`网易云仍拒绝播放请求（${code}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
         }
-        if ([401, 403].includes(code)) {
+        if (code === 401) {
+          // A 401 inside the song record may be this song's permission or an
+          // ended login. Ask the account, read-only, as the top-level 401 does,
+          // instead of deciding from the number. No lower level can answer it.
+          records.push(streamDiagnostic(id, level, "denied", audio, code));
+          if (await sessionExpired(activeSession, generation)) {
+            if (activeSession === session && generation === epoch) clearSession();
+            throw fail("signIn", "请重新登录网易云音乐");
+          }
+          throw fail("unavailable", "当前账号无权播放这首歌");
+        }
+        if (code === 403) {
           records.push(streamDiagnostic(id, level, "denied", audio, code));
           throw fail("unavailable", "当前账号无权播放这首歌");
         }
@@ -879,12 +931,19 @@ async function loadStream(id, quality, generation) {
           }
           throw new Error(`网易云暂时无法返回音源（${code}），请稍后重试`);
         }
-        if (!audio.url || (code != null && code !== 200)) {
-          // The service answered for this song, and has no source at this
-          // level. The level below may still have one: ask it, within bounds.
+        // Downgrading is allowed only for a shape that proves this level has no
+        // source: a successful record without a URL, or the 404 already used
+        // above. An unlisted code, a record that contradicts itself, or a login
+        // code inside this layer (301/302 carries no evidence here) is not that
+        // proof: stop, keep the session, and keep the number.
+        if (!audio.url && (code === 200 || code === 404)) {
           records.push(streamDiagnostic(id, level, "missing", audio, code));
           missing = `网易云未返回可播放音源（已尝试：${tried.join("、")}）`;
           break;
+        }
+        if (!audio.url || (code != null && code !== 200)) {
+          records.push(streamDiagnostic(id, level, "refused", audio, code));
+          throw neteaseRefusal(code, `网易云返回了无法识别的音源结果（${code == null ? "无结果码" : code}），已停止降档`);
         }
         const url = new URL(secureURL(audio.url));
         const type = String(audio.type || "mp3").toLowerCase();

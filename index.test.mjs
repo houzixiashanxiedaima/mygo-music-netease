@@ -548,6 +548,175 @@ test("a content 401 that deletes the cookie signs out only after the account che
   assert.equal(storage.has("session"), false);
 });
 
+// The check is a window, not a permanent answer: once it lapses, the next 401
+// must ask the account again, or an expiry after the first check is never seen.
+test("an expired account check asks the account again", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"] });
+  let probes = 0;
+  let hasAccount = true;
+  const { plugin, storage } = await setup(async (url) => {
+    if (url.includes("/api/nuser/account/get")) {
+      probes++;
+      return hasAccount ? response(ACCOUNT_OK) : response({ code: 200 });
+    }
+    return response({ code: 401 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+  assert.equal(probes, 1);
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  hasAccount = false;
+  t.mock.timers.tick(31000);
+  await assert.rejects(plugin.stream({ id: "2" }), { code: "signIn" });
+  assert.equal(probes, 2);
+  assert.equal(storage.has("session"), false);
+});
+
+// A 401 inside the song record is the same ambiguous 401 as the top-level one:
+// ask the account read-only, and never sign out on the number alone.
+test("a 401 inside the song record asks the account instead of signing out", async () => {
+  let probes = 0;
+  let streams = 0;
+  const { plugin, storage } = await setup(async (url) => {
+    if (url.includes("/api/nuser/account/get")) {
+      probes++;
+      return response(ACCOUNT_OK);
+    }
+    streams++;
+    return response({ code: 200, data: [{ id: 1, code: 401, url: null }] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), { code: "unavailable" });
+  assert.equal(probes, 1);
+  // No lower level can answer a refused login, so only the asked level ran.
+  assert.equal(streams, 1);
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+});
+
+// A 401 inside the song record with no account behind it is a real expiry, and
+// the dead credentials must not stay in storage.
+test("a 401 inside the song record signs out when the account is gone", async () => {
+  const { plugin, storage } = await setup(async (url) => url.includes("/api/nuser/account/get")
+    ? response({ code: 200 })
+    : response({ code: 200, data: [{ id: 1, code: 401, url: null }] }),
+  { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "signIn" });
+  assert.equal(storage.has("session"), false);
+});
+
+// A check that cannot finish says nothing about the login, so the song-record
+// 401 keeps the session just like the top-level one does.
+test("a 401 inside the song record keeps the session when the check cannot finish", async () => {
+  for (const answer of [
+    () => { throw new Error("network down"); },
+    () => response({ code: 460 }),
+    () => response({ code: 200, profile: { nickname: "Fixture" } }),
+  ]) {
+    const { plugin, storage } = await setup(async (url) => url.includes("/api/nuser/account/get")
+      ? answer()
+      : response({ code: 200, data: [{ id: 1, code: 401, url: null }] }),
+    { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+    assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  }
+});
+
+// A cached "still signed in" belongs to the credential it was asked with. If
+// the same window later loses MUSIC_U, the next 401 must check again.
+test("a cached account check stops answering once the cookie is gone", async () => {
+  let refusals = 0;
+  const { plugin, storage } = await setup(async (url) => {
+    if (url.includes("/api/nuser/account/get")) return response(ACCOUNT_OK);
+    refusals++;
+    return refusals === 1
+      ? response({ code: 401 })
+      : response({ code: 401 }, ["MUSIC_U=deleted; Max-Age=0; Path=/"]);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  await assert.rejects(plugin.stream({ id: "2" }), { code: "signIn" });
+  assert.equal(storage.has("session"), false);
+});
+
+// 301 and 302 inside the song record carry no evidence here that the login
+// ended, and no lower level can answer them: stop, keep the session and code.
+test("a 301 or 302 inside the song record stops without downgrading or signing out", async () => {
+  for (const code of [301, 302]) {
+    const levels = [];
+    const { plugin, storage } = await setup(async (_url, init) => {
+      levels.push(decode(init.body).data.level);
+      return response({ code: 200, data: [{ id: 1, code, url: null }] });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), (error) => {
+      assert.equal(error.code, undefined, String(code));
+      assert.equal(error.neteaseCode, code, String(code));
+      assert.match(error.message, new RegExp(String(code)), String(code));
+      return true;
+    });
+    assert.deepEqual(levels, ["lossless"], String(code));
+    assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+    assert.deepEqual(storage.get("streamLog").map(entry => [entry.level, entry.outcome, entry.code]),
+      [["lossless", "refused", code]], String(code));
+  }
+});
+
+// Downgrading is only allowed for a shape that proves the level has no source.
+// An unlisted code, a missing code, or a record that contradicts itself is not
+// that proof: stop at the level asked and keep the number for the reader.
+test("an unlisted stream result stops at the level asked and keeps its number", async () => {
+  for (const [record, code, label] of [
+    [{ id: 1, code: 402, url: null }, 402, "402"],
+    [{ id: 1, url: null }, null, "no code"],
+    [{ id: 1, code: 404, url: "https://m1.music.126.net/song.mp3" }, 404, "contradictory 404"],
+  ]) {
+    const levels = [];
+    const { plugin, storage } = await setup(async (_url, init) => {
+      levels.push(decode(init.body).data.level);
+      return response({ code: 200, data: [record] });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), (error) => {
+      assert.equal(error.code, undefined, label);
+      assert.equal(error.neteaseCode, code, label);
+      assert.match(error.message, /已停止降档/, label);
+      return true;
+    });
+    assert.deepEqual(levels, ["lossless"], label);
+    assert.deepEqual(storage.get("streamLog").map(entry => [entry.level, entry.outcome, entry.code]),
+      [["lossless", "refused", code ?? null]], label);
+  }
+});
+
+// The top-level 405, a failed HTTP request, and an unlisted JSON code must all
+// leave their number in the diagnostics. Only the already-transient ones are
+// retried: recording a code must not widen the retry policy.
+test("stream diagnostics record the code of a top-level refusal or HTTP failure", async () => {
+  for (const [answer, code, attempts, outcome] of [
+    [() => response({ code: 405 }), 405, 2, "transient"],
+    [() => ({ ok: false, status: 502, json: async () => ({}), headers: { getSetCookie: () => [] } }), 502, 2, "transient"],
+    [() => response({ code: 503 }), 503, 1, "error"],
+  ]) {
+    let calls = 0;
+    const { plugin, storage } = await setup(async () => { calls++; return answer(); },
+      { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.stream({ id: "1", quality: "lossless" }), { neteaseCode: code });
+    assert.equal(calls, attempts, String(code));
+    const log = storage.get("streamLog");
+    assert.equal(log.length, attempts, String(code));
+    for (const entry of log) assert.deepEqual([entry.level, entry.outcome, entry.code], ["lossless", outcome, code], String(code));
+  }
+});
+
+// An account answer without a usable ID is neither an account nor proof that
+// the login ended: never cache it and never sign out over it.
+test("an account answer without a usable ID is neither cached nor a sign-out", async () => {
+  const { plugin, storage } = await setup(async (url) => url.includes("/api/nuser/account/get")
+    ? response({ code: 200, profile: { nickname: "Fixture" } })
+    : response({ code: 200, data: [{ id: 1, code: 401, url: null }] }),
+  { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  assert.equal(storage.get("session").profile ?? null, null);
+  await assert.rejects(plugin.account(), /有效的账号信息/);
+});
+
 // Diagnostics are kept for reading later, so they are bounded and hold nothing
 // that could identify the listener or the audio.
 test("stream diagnostics stay bounded and leave out URLs and cookies", async () => {
