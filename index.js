@@ -63,6 +63,8 @@ const pendingStreams = new Map();
 // Shared by every stream request: a refusal pauses the next source fetch, but
 // never an unrelated API call.
 let streamCooldownUntil = 0;
+let streamGate = Promise.resolve();
+let streamNextAllowedAt = 0;
 // Short reuse of a successful source, keyed by session, song and the quality
 // that was asked for. The value keeps the quality the response proved.
 const streamCache = new Map();
@@ -222,6 +224,14 @@ function persistSession() {
   else host.storage.remove("session");
 }
 
+function resetStreamRequests() {
+  pendingStreams.clear();
+  streamCache.clear();
+  streamCooldownUntil = 0;
+  streamNextAllowedAt = 0;
+  streamGate = Promise.resolve();
+}
+
 function clearSession() {
   epoch++;
   session = { cookies: {}, profile: null };
@@ -229,9 +239,7 @@ function clearSession() {
   probeRecord = null;
   probeRun = null;
   likedCache = null;
-  pendingStreams.clear();
-  // A source cached for the old session must never answer for the next one.
-  streamCache.clear();
+  resetStreamRequests();
   heartState = null;
   pendingHeart = null;
   host.storage.remove("session");
@@ -299,6 +307,7 @@ async function request(path, params = {}, options = {}) {
   let response, body;
   try {
     response = await fetch(url, init);
+    if (options.responseMeta) options.responseMeta.retryAfterMs = retryAfterDelay(response.headers);
     if (!response.ok) throw httpFailure(response.status, retryAfterDelay(response.headers));
     body = await response.json();
   } catch (error) {
@@ -312,7 +321,10 @@ async function request(path, params = {}, options = {}) {
   } finally {
     clearTimeout(timer);
   }
-  if (startedEpoch !== epoch) throw new Error("账号状态已改变，请重试");
+  if (startedEpoch !== epoch || (options.streamSession && options.streamSession !== session)) {
+    throw new Error("账号状态已改变，请重试");
+  }
+  if (options.deadline !== undefined && Date.now() >= options.deadline) throw deadlineFailure();
   if (!body || typeof body !== "object") throw new Error("网易云返回了无效数据");
   const code = Number(body.code);
   const allowed = options.codes || [200];
@@ -604,6 +616,7 @@ export async function signIn() {
       if (!pending.profile) throw new Error("无法读取已登录账号，请重新扫码");
       if (startedEpoch !== epoch) break;
       session = pending;
+      resetStreamRequests();
       heartState = null;
       pendingHeart = null;
       probeRecord = null;
@@ -1039,25 +1052,26 @@ export async function lyrics({ id }) {
 // A successful source is kept for a very short window, keyed by the session,
 // the song and the quality that was asked for. The result keeps the quality
 // the response proved, so a fallback is never relabelled as the request.
-function cachedStream(key) {
+function cachedStream(key, activeSession) {
   const entry = streamCache.get(key);
   if (!entry) return null;
-  if (Date.now() - entry.at >= STREAM_CACHE_TTL_MS) {
+  if (entry.session !== activeSession || entry.credential !== activeSession.cookies.MUSIC_U ||
+      Date.now() < entry.at || Date.now() - entry.at >= STREAM_CACHE_TTL_MS) {
     streamCache.delete(key);
     return null;
   }
   return entry;
 }
 
-function rememberStream(key, result, diagnostic, generation) {
+function rememberStream(key, result, diagnostic, generation, activeSession, deadline) {
   // A session change while the request was in flight makes this answer belong
   // to the previous session. Never let it answer for the current one.
-  if (generation !== epoch) return;
+  if (generation !== epoch || activeSession !== session || Date.now() >= deadline) return;
   // NetEase's URL record has no expiry field with documented units, so none is
-  // interpreted here. The TTL is short and only complete, non-trial sources
-  // are stored: a result the server calls shorter than this window is not put
-  // in the cache at all.
+  // interpreted here. Only complete, non-trial sources are kept for this
+  // short reuse window; it is not a claim about the URL's server-side lifetime.
   streamCache.set(key, {
+    session: activeSession, credential: activeSession.cookies.MUSIC_U,
     at: Date.now(),
     result: { ...result, headers: { ...result.headers } },
     diagnostic: { ...diagnostic },
@@ -1067,18 +1081,28 @@ function rememberStream(key, result, diagnostic, generation) {
   }
 }
 
-function coolDownStreams() {
-  streamCooldownUntil = Math.max(streamCooldownUntil, Date.now() + STREAM_COOLDOWN_MS);
+function coolDownStreams(retryAfterMs = 0) {
+  streamCooldownUntil = Math.max(streamCooldownUntil, Date.now() + Math.max(STREAM_COOLDOWN_MS, retryAfterMs));
 }
 
 async function waitForStreamCooldown(deadline, minimumDelay = 0) {
-  const target = Math.max(streamCooldownUntil, Date.now() + minimumDelay);
-  const delay = target - Date.now();
-  if (delay <= 0) return;
-  const left = deadline - Date.now();
-  if (left <= 0) throw deadlineFailure();
-  await new Promise(resolve => setTimeout(resolve, Math.min(delay, left)));
-  if (Date.now() >= deadline) throw deadlineFailure();
+  const activeSession = session, generation = epoch;
+  const earliest = Date.now() + minimumDelay;
+  const queued = streamGate.then(async () => {
+    for (;;) {
+      if (activeSession !== session || generation !== epoch) throw new Error("账号状态已改变，请重试");
+      const now = Date.now();
+      if (now >= deadline) throw deadlineFailure();
+      const delay = Math.max(streamCooldownUntil, streamNextAllowedAt, earliest) - now;
+      if (delay <= 0) break;
+      await new Promise(resolve => setTimeout(resolve, Math.min(delay, deadline - now)));
+    }
+    // Retry waiting is not a request. Reserve a start slot only at the actual
+    // attempt boundary, keeping different songs apart after a shared cooldown.
+    if (minimumDelay === 0) streamNextAllowedAt = Date.now() + 200;
+  });
+  streamGate = queued.catch(() => {});
+  return beforeDeadline(queued, deadline);
 }
 
 async function waitForStreamRetry(error, deadline) {
@@ -1099,15 +1123,15 @@ export async function stream({ id, quality = "high" }) {
   const generation = epoch;
   const asked = STREAM_LEVELS[quality] ? quality : "high";
   const key = `${generation}:${id}:${asked}`;
-  const cached = cachedStream(key);
+  const cached = cachedStream(key, activeSession);
   if (cached) {
     // Reuse is worth recording, but it is still just fields: no URL, no query.
-    rememberStreamDiagnostics([{ ...cached.diagnostic, at: new Date().toISOString(), outcome: "cached" }]);
+    rememberStreamDiagnostics([{ ...cached.diagnostic, at: new Date().toISOString(), outcome: "cached", attempt: 0, waitMs: 0, elapsedMs: 0 }]);
     return { ...cached.result, headers: { ...cached.result.headers } };
   }
   if (pendingStreams.has(key)) return pendingStreams.get(key);
   const deadline = Date.now() + STREAM_BUDGET_MS;
-  const pending = loadStream(id, asked, generation, activeSession, deadline, key);
+  const pending = beforeDeadline(loadStream(id, asked, generation, activeSession, deadline, key), deadline);
   pendingStreams.set(key, pending);
   try { return await pending; }
   finally { if (pendingStreams.get(key) === pending) pendingStreams.delete(key); }
@@ -1117,24 +1141,36 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
   const records = [];
   const tried = [];
   let missing = "";
+  let waitMs = 0, attemptNumber = 0;
+  const began = Date.now();
+  const diagnose = (...args) => ({
+    ...streamDiagnostic(...args), attempt: attemptNumber, waitMs, elapsedMs: Date.now() - began,
+  });
+  const waited = async (promise) => {
+    const started = Date.now();
+    try { return await promise; } finally { waitMs += Date.now() - started; }
+  };
   try {
     // A refusal pauses the next source fetch. The first call made while a
     // cooldown is active still waits, but unrelated APIs never do.
-    await waitForStreamCooldown(deadline);
     for (let ask = quality; ask; ask = LOWER_QUALITY[ask]) {
       const level = STREAM_LEVELS[ask];
       tried.push(QUALITY_NAMES[ask]);
       for (let attempt = 1; ; attempt++) {
-        if (generation !== epoch) throw new Error("账号状态已改变，请重试");
+        if (generation !== epoch || activeSession !== session) throw new Error("账号状态已改变，请重试");
+        await waited(waitForStreamCooldown(deadline));
+        if (generation !== epoch || activeSession !== session) throw new Error("账号状态已改变，请重试");
         let data;
+        const responseMeta = {};
+        attemptNumber++;
         try {
           data = await eapi("/api/song/enhance/player/url/v1", {
             ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
-          }, { deadline });
+          }, { deadline, session: activeSession, streamSession: activeSession, responseMeta });
         } catch (error) {
-          records.push(streamDiagnostic(id, level, error.transient ? "transient" : "error", null, error.neteaseCode));
+          records.push(diagnose(id, level, error.transient ? "transient" : "error", null, error.neteaseCode));
           if (error.deadline || !error.transient) throw error;
-          coolDownStreams();
+          coolDownStreams(error.retryAfterMs);
           if (attempt >= STREAM_ATTEMPTS) {
             // Still refused at the quality asked for, so this song may play
             // later: say that, and never turn a refusal into a lower level.
@@ -1143,17 +1179,17 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
             }
             throw error;
           }
-          await waitForStreamRetry(error, deadline);
+          await waited(waitForStreamRetry(error, deadline));
           continue;
         }
         const audio = (data.data || []).find((item) => String(item.id) === id);
         if (!audio) {
           // A success without this song's record is a soft refusal or a moment
           // of the service, not proof that the account may not play it.
-          records.push(streamDiagnostic(id, level, "empty", null, data.code));
-          coolDownStreams();
+          records.push(diagnose(id, level, "empty", null, data.code));
+          coolDownStreams(responseMeta.retryAfterMs);
           if (attempt < STREAM_ATTEMPTS) {
-            await waitForStreamCooldown(deadline, STREAM_RETRY_MS);
+            await waited(waitForStreamCooldown(deadline, Math.max(STREAM_RETRY_MS, responseMeta.retryAfterMs || 0)));
             continue;
           }
           throw new Error("网易云未返回这首歌的音源，请稍后重试");
@@ -1162,14 +1198,14 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
         if (audio.freeTrialInfo != null) {
           // A trial is all this account may play: a lower level never gives
           // more, so never fall back, and never hand the clip to the host.
-          records.push(streamDiagnostic(id, level, "trial", audio, code));
+          records.push(diagnose(id, level, "trial", audio, code));
           throw fail("unavailable", "当前账号只有这首歌的试听权限，无法播放完整版本");
         }
         if ([460, -460].includes(code)) {
-          records.push(streamDiagnostic(id, level, "transient", audio, code));
-          coolDownStreams();
+          records.push(diagnose(id, level, "transient", audio, code));
+          coolDownStreams(responseMeta.retryAfterMs);
           if (attempt < STREAM_ATTEMPTS) {
-            await waitForStreamCooldown(deadline, STREAM_RETRY_MS);
+            await waited(waitForStreamCooldown(deadline, Math.max(STREAM_RETRY_MS, responseMeta.retryAfterMs || 0)));
             continue;
           }
           throw new Error(`网易云仍拒绝播放请求（${code}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
@@ -1178,7 +1214,7 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
           // A 401 inside the song record may be this song's permission or an
           // ended login. Ask the account, read-only, as the top-level 401 does,
           // instead of deciding from the number. No lower level can answer it.
-          records.push(streamDiagnostic(id, level, "denied", audio, code));
+          records.push(diagnose(id, level, "denied", audio, code));
           let expired = false;
           try {
             expired = await sessionExpired(activeSession, generation, deadline);
@@ -1194,16 +1230,16 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
           throw fail("unavailable", "当前账号无权播放这首歌");
         }
         if (code === 403) {
-          records.push(streamDiagnostic(id, level, "denied", audio, code));
+          records.push(diagnose(id, level, "denied", audio, code));
           throw fail("unavailable", "当前账号无权播放这首歌");
         }
         if (transientCode(code)) {
           // Throttling and server errors say nothing about this level either:
           // answer them the way a failed request is answered, at the same level.
-          records.push(streamDiagnostic(id, level, "transient", audio, code));
-          coolDownStreams();
+          records.push(diagnose(id, level, "transient", audio, code));
+          coolDownStreams(responseMeta.retryAfterMs);
           if (attempt < STREAM_ATTEMPTS) {
-            await waitForStreamCooldown(deadline, STREAM_RETRY_MS);
+            await waited(waitForStreamCooldown(deadline, Math.max(STREAM_RETRY_MS, responseMeta.retryAfterMs || 0)));
             continue;
           }
           throw new Error(`网易云暂时无法返回音源（${code}），请稍后重试`);
@@ -1214,32 +1250,32 @@ async function loadStream(id, quality, generation, activeSession, deadline, cach
         // code inside this layer (301/302 carries no evidence here) is not that
         // proof: stop, keep the session, and keep the number.
         if (!audio.url && (code === 200 || code === 404)) {
-          records.push(streamDiagnostic(id, level, "missing", audio, code));
+          records.push(diagnose(id, level, "missing", audio, code));
           missing = `网易云未返回可播放音源（已尝试：${tried.join("、")}）`;
           break;
         }
         if (!audio.url || (code != null && code !== 200)) {
-          records.push(streamDiagnostic(id, level, "refused", audio, code));
+          records.push(diagnose(id, level, "refused", audio, code));
           throw neteaseRefusal(code, `网易云返回了无法识别的音源结果（${code == null ? "无结果码" : code}），已停止降档`);
         }
         const url = new URL(secureURL(audio.url));
         const type = String(audio.type || "mp3").toLowerCase();
         if (url.protocol !== "https:" || !/^(?:[a-z0-9-]+\.)*music\.126\.net$/i.test(url.hostname)) {
-          records.push(streamDiagnostic(id, level, "error", audio, code));
+          records.push(diagnose(id, level, "error", audio, code));
           throw fail("unavailable", "网易云返回了不支持的音频地址");
         }
         if (!["mp3", "flac", "ogg"].includes(type)) {
-          records.push(streamDiagnostic(id, level, "error", audio, code));
+          records.push(diagnose(id, level, "error", audio, code));
           throw fail("unavailable", "该歌曲的音频格式暂不支持");
         }
-        const diagnostic = streamDiagnostic(id, level, "ok", audio, code);
+        const diagnostic = diagnose(id, level, "ok", audio, code);
         records.push(diagnostic);
         const result = {
           url: url.toString(), type, size: audio.size || 0, bitRate: audio.br || 0,
           quality: streamQuality(audio), gain: audio.gain || 0, peak: audio.peak || 0,
           headers: { "User-Agent": UA, Referer: `${SITE}/` },
         };
-        rememberStream(cacheKey, result, diagnostic, generation);
+        rememberStream(cacheKey, result, diagnostic, generation, activeSession, deadline);
         return result;
       }
     }

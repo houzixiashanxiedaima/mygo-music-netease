@@ -12,7 +12,7 @@ const response = (body, cookies = [], headers = {}) => ({
 });
 // Mock timers replace setImmediate too; a microtask flush still lets the
 // fetch promise chain settle before the next tick.
-const flush = async () => { for (let i = 0; i < 6; i++) await Promise.resolve(); };
+const flush = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
 
 async function setup(handler, savedSession) {
   const storage = new Map(savedSession ? [["session", structuredClone(savedSession)]] : []);
@@ -800,7 +800,7 @@ test("stream diagnostics stay bounded and leave out URLs and cookies", async () 
   assert.ok(!saved.includes("audio%2Ftoken&expires=123"), saved);
   assert.ok(!saved.includes("synthetic-session"), saved);
   assert.ok(!saved.includes("https://"), saved);
-  assert.deepEqual(Object.keys(log[0]).sort(), ["actual", "at", "code", "hasURL", "level", "outcome", "song", "trial"]);
+  assert.deepEqual(Object.keys(log[0]).sort(), ["actual", "at", "attempt", "code", "elapsedMs", "hasURL", "level", "outcome", "song", "trial", "waitMs"]);
   assert.deepEqual([log[0].song, log[0].level, log[0].code, log[0].hasURL, log[0].trial, log[0].actual],
     ["6", "exhigh", 200, true, false, "exhigh"]);
   assert.deepEqual([log.at(-1).song, log.at(-1).outcome], ["25", "ok"]);
@@ -826,6 +826,74 @@ test("stream reports the quality the response proves", async () => {
 // Prefetch and the real play often ask for the same song within a moment. A
 // short cache may reuse that answer, but it must keep the quality the response
 // proved and must use the quality that was asked for as its key.
+test("cooldown releases different songs in separate request slots", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const starts = []; let refused = false;
+  const { plugin, storage } = await setup(async (_url, init) => {
+    const id = JSON.parse(decode(init.body).data.ids)[0];
+    starts.push({ id, at: Date.now() });
+    if (!refused) { refused = true; return response({ code: -460 }); }
+    return response({ code: 200, data: [{ id, code: 200, url: "https://m1.music.126.net/source.flac", type: "flac" }] });
+  });
+  const settle = async () => { for (let i = 0; i < 12; i++) await flush(); };
+  const first = plugin.stream({ id: "1" }); await settle();
+  const second = plugin.stream({ id: "2" }); const third = plugin.stream({ id: "3" }); await settle();
+  t.mock.timers.tick(2000); await settle();
+  assert.equal(starts.length, 2, "only one request leaves at the cooldown boundary");
+  t.mock.timers.tick(200); await settle();
+  t.mock.timers.tick(200); await settle();
+  await Promise.all([first, second, third]);
+  for (let i = 2; i < starts.length; i++) assert.ok(starts[i].at - starts[i - 1].at >= 200);
+  const recovered = storage.get("streamLog").find(item => item.song === "1" && item.outcome === "ok");
+  assert.equal(recovered.attempt, 2);
+  assert.ok(recovered.waitMs >= 2000);
+  assert.ok(recovered.elapsedMs >= recovered.waitMs);
+});
+
+test("QR completion invalidates sources fetched while the old session was active", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let calls = 0;
+  const { plugin } = await setup(async (url) => {
+    if (url.includes("/qrcode/unikey")) return response({ code: 200, unikey: "fixture-qr" });
+    if (url.includes("/qrcode/client/login")) return response({ code: 803 }, ["MUSIC_U=synthetic-new; Path=/"]);
+    if (url.includes("/nuser/account/get")) return response({ code: 200, profile: { userId: 2, nickname: "Fixture" } });
+    calls++; return response({ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/source.flac", type: "flac" }] });
+  }, { cookies: { MUSIC_U: "synthetic-old" }, profile: { id: "1" } });
+  const login = plugin.signIn();
+  await plugin.stream({ id: "1" });
+  t.mock.timers.tick(1500); for (let i = 0; i < 12; i++) await flush();
+  await login;
+  await plugin.stream({ id: "1" });
+  assert.equal(calls, 2, "new session cannot reuse the old session's source");
+});
+
+test("late successful source responses are rejected before caching", async (t) => {
+  let clock = Date.now(); t.mock.method(Date, "now", () => clock);
+  const { plugin, storage } = await setup(async () => {
+    clock += 26000;
+    return response({ code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/source.flac", type: "flac" }] });
+  });
+  await assert.rejects(plugin.stream({ id: "1" }), error => error.deadline === true);
+  assert.ok((storage.get("streamLog") || []).every(item => item.outcome !== "ok"));
+});
+
+test("Retry-After is shared by later source calls, not only the rejected call", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let calls = 0;
+  const { plugin } = await setup(async () => {
+    calls++;
+    if (calls === 1) return response({ code: 429 }, [], { "retry-after": "60" });
+    return response({ code: 200, data: [{ id: 2, code: 200, url: "https://m1.music.126.net/source.flac", type: "flac" }] });
+  });
+  await assert.rejects(plugin.stream({ id: "1" }), error => error.deadline === true);
+  const waiting = plugin.stream({ id: "2" }).then(value => ({ value }), error => ({ error }));
+  for (let i = 0; i < 12; i++) await flush();
+  t.mock.timers.tick(2000); for (let i = 0; i < 12; i++) await flush();
+  assert.equal(calls, 1, "new calls must not shorten the server's requested wait");
+  t.mock.timers.tick(23000); for (let i = 0; i < 12; i++) await flush();
+  assert.equal((await waiting).error.deadline, true);
+});
+
 test("stream reuses a brief successful source without relabelling a fallback", async () => {
   const levels = [];
   const { plugin, storage } = await setup(async (_url, init) => {
