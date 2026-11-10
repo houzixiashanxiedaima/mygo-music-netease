@@ -44,6 +44,10 @@ const STREAM_BUDGET_MS = 25000;
 const PROBE_TIMEOUT_MS = 10000;
 // The last attempts kept for reading later, as a ring.
 const DIAGNOSTIC_LIMIT = 20;
+// Play history kept on this machine, and the size of the service's list that
+// is merged with it. No play is uploaded: this is a reading list, not a log.
+const RECENT_LIMIT = 100;
+const RECENT_GUEST = "guest";
 // A content 401 does not prove the login expired. One account check answers
 // for every 401 in this window, so a song the account may not open does not
 // add a request per refusal.
@@ -531,8 +535,11 @@ function toComment(comment) {
   };
 }
 
-async function songDetails(ids, originals = [], options = {}) {
-  if (!ids.length) return [];
+// Detail records by ID, with the account's privileges filled in. The play
+// history uses this map directly: a song the service no longer returns must
+// not turn into a row the listener cannot open.
+async function detailSongs(ids, options = {}) {
+  if (!ids.length) return new Map();
   const batches = [];
   for (let offset = 0; offset < ids.length; offset += 400) {
     batches.push(ids.slice(offset, offset + 400));
@@ -542,7 +549,12 @@ async function songDetails(ids, originals = [], options = {}) {
     const privileges = new Map((data.privileges || []).map((p) => [String(p.id), p]));
     return (data.songs || []).map((song) => ({ ...song, privilege: privileges.get(String(song.id)) || song.privilege }));
   }));
-  const byID = new Map(results.flat().map((song) => [String(song.id), song]));
+  return new Map(results.flat().map((song) => [String(song.id), song]));
+}
+
+async function songDetails(ids, originals = [], options = {}) {
+  if (!ids.length) return [];
+  const byID = await detailSongs(ids, options);
   const fallback = new Map(originals.map((song) => [String(song.id), song]));
   // MyGo advances offset by the number of returned tracks. Keep a slot for
   // every requested ID, including songs removed from the detail response.
@@ -800,6 +812,14 @@ export async function browse({ page }) {
       ],
     };
   }
+  if (page === "recent") {
+    const { tracks, note } = await recentTracks();
+    return {
+      title: "最近播放",
+      subtitle: note || "本机与网易云音乐最近播放的歌曲",
+      sections: [{ tracks, empty: "还没有播放记录，播放一首歌后就会出现在这里。" }],
+    };
+  }
   if (page !== "charts") throw fail("unsupported", "没有这个页面");
   const data = await request("/api/toplist/detail");
   return { title: "排行榜", sections: [{ playlists: (data.list || []).map(toPlaylist) }] };
@@ -941,6 +961,96 @@ export async function like({ id, on }) {
   await requireAccount();
   await eapi("/api/radio/like", { alg: "itembased", trackId: identity.audio, like: String(!!on), time: "3" });
   likedCache = null;
+}
+
+// Play history is kept per account, so switching accounts never shows the
+// previous one's songs. A session that holds a credential but has no account
+// yet cannot be attributed and records nothing, rather than guessing.
+function recentOwner(activeSession) {
+  if (activeSession.cookies.MUSIC_U) return activeSession.profile?.id ? String(activeSession.profile.id) : "";
+  return RECENT_GUEST;
+}
+
+function readRecent(owner) {
+  if (!owner) return [];
+  const saved = host.storage.get(`recent:${owner}`);
+  if (!Array.isArray(saved)) return [];
+  return saved.map((entry) => ({ id: externalID(entry?.id), at: Number(entry?.at) }))
+    .filter((entry) => entry.id && Number.isFinite(entry.at) && entry.at > 0)
+    .slice(0, RECENT_LIMIT);
+}
+
+// The host calls this when a track starts playing, never for a prefetched one.
+// Remember it without asking NetEase: the play itself already cost a request.
+export function played({ id }) {
+  const value = externalID(id);
+  // Episodes are not songs: a podcast in a song history would play the wrong
+  // audio later, so only a song ID is kept.
+  if (!value) return;
+  const owner = recentOwner(currentSession());
+  if (!owner) return;
+  const entries = readRecent(owner).filter((entry) => entry.id !== value);
+  entries.unshift({ id: value, at: Date.now() });
+  host.storage.set(`recent:${owner}`, entries.slice(0, RECENT_LIMIT));
+}
+
+// The service's own list answers for every device. It is an eapi call, and
+// its rows carry no privileges, so detail records are merged in below.
+async function cloudRecent(activeSession) {
+  const data = await eapi("/api/play-record/song/list", { limit: RECENT_LIMIT }, { session: activeSession });
+  const rows = data.data?.list;
+  if (!Array.isArray(rows)) throw new Error("网易云返回了无效的播放记录");
+  return rows.map((row) => row?.data).filter((song) => song && externalID(song.id));
+}
+
+// Local plays come first because they are newest; the service's order follows.
+// One detail request resolves names, covers and privileges for both, and a
+// local song the service dropped is left out instead of shown as unplayable.
+async function recentTracks() {
+  const activeSession = currentSession();
+  const generation = epoch;
+  let owner = recentOwner(activeSession);
+  if (!owner && activeSession.cookies.MUSIC_U) {
+    // A restored session normally carries its profile. Ask once when it does
+    // not, instead of filing these plays under the wrong account.
+    const profile = await account();
+    owner = profile?.id ? String(profile.id) : "";
+  }
+  let cloud = [];
+  let note = "";
+  if (activeSession.cookies.MUSIC_U) {
+    try {
+      cloud = await cloudRecent(activeSession);
+    } catch (error) {
+      if (error.code === "signIn") throw error;
+      // A state change is not the service being unavailable.
+      if (generation !== epoch || activeSession !== session) throw new Error("账号状态已改变，请重试");
+      note = "云端播放记录暂时无法加载，只显示本机记录。";
+    }
+  }
+  if (generation !== epoch || activeSession !== session) throw new Error("账号状态已改变，请重试");
+  const cloudSongs = new Map(cloud.map((song) => [String(song.id), song]));
+  const ids = [];
+  const seen = new Set();
+  for (const id of [...readRecent(owner).map((entry) => entry.id), ...cloudSongs.keys()]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= RECENT_LIMIT) break;
+  }
+  if (!ids.length) return { tracks: [], note };
+  const byID = await detailSongs(ids, { session: activeSession });
+  if (generation !== epoch || activeSession !== session) throw new Error("账号状态已改变，请重试");
+  const tracks = [];
+  for (const id of ids) {
+    const song = byID.get(id) || cloudSongs.get(id);
+    if (song) tracks.push(toTrack(song));
+  }
+  return { tracks, note };
+}
+
+export async function recent() {
+  return (await recentTracks()).tracks;
 }
 
 function checkPlaylistSession(activeSession, generation) {

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { createCipheriv, createDecipheriv, createHash } from "node:crypto";
 
 let sequence = 0;
@@ -1422,4 +1423,141 @@ test("fixed playlist mapping preserves ownership across lists and detail", async
       assert.equal(mapped.saved, !!source.subscribed, `saved for ${source.id}`);
     }
   }
+});
+
+// A play costs no request: the host's callback gives the ID, and the history
+// is only a reading list. Episodes stay out so a later play cannot find the
+// wrong audio behind a song ID.
+test("played records song history locally without asking NetEase", async () => {
+  let calls = 0;
+  const { plugin, storage } = await setup(async () => { calls++; return response({ code: 200 }); },
+    { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  plugin.played({ id: "1" });
+  plugin.played({ id: "program:2:3" });
+  plugin.played({ id: "not-a-song" });
+  plugin.played({ id: 2 });
+  plugin.played({ id: "1" });
+  assert.equal(calls, 0);
+  assert.deepEqual(storage.get("recent:7").map((entry) => entry.id), ["1", "2"]);
+  assert.ok(storage.get("recent:7").every((entry) => Number.isFinite(entry.at) && entry.at > 0));
+});
+
+// The host calls played once per track, so repeats must not grow the list and
+// an evening of listening must not grow storage without bound.
+test("play history keeps the newest hundred songs and moves repeats to the front", async () => {
+  const { plugin, storage } = await setup(async () => response({ code: 200 }));
+  for (let i = 1; i <= 105; i++) plugin.played({ id: String(i) });
+  plugin.played({ id: "50" });
+  const entries = storage.get("recent:guest");
+  assert.equal(entries.length, 100);
+  assert.deepEqual(entries.slice(0, 2).map((entry) => entry.id), ["50", "105"]);
+  assert.equal(new Set(entries.map((entry) => entry.id)).size, 100);
+  assert.equal(entries.at(-1).id, "6");
+});
+
+// One machine, two accounts: the second must never see the first one's songs,
+// and a session without a profile must not guess whose plays they are.
+test("history stays with one account across sign-out and guest listening", async () => {
+  let calls = 0;
+  const { plugin, storage } = await setup(async (url) => {
+    if (url.includes("play-record")) throw new Error(`unexpected cloud request: ${url}`);
+    calls++;
+    return response({ code: 200, songs: [song(2)], privileges: [{ id: 2, st: 0, pl: 320000 }] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  plugin.played({ id: "1" });
+  plugin.signOut();
+  plugin.played({ id: "2" });
+  assert.deepEqual(storage.get("recent:7").map((entry) => entry.id), ["1"]);
+  assert.deepEqual(storage.get("recent:guest").map((entry) => entry.id), ["2"]);
+  assert.deepEqual((await plugin.recent()).map((track) => track.id), ["2"]);
+  assert.equal(calls, 1);
+});
+
+// Local plays are newest, the service's list is its own order: merge them once
+// and let one detail request give every row the account's privileges.
+test("recent merges local plays with the service list and fills cloud privileges", async () => {
+  const requests = [];
+  const { plugin, storage } = await setup(async (url, init) => {
+    const { path, data } = decode(init.body);
+    requests.push(path);
+    if (path === "/api/play-record/song/list") {
+      assert.equal(data.limit, 100);
+      assert.equal(data.header.MUSIC_U, "synthetic-session");
+      return response({ code: 200, data: { list: [{ data: song(2) }, { data: song(3) }, { data: null }] } });
+    }
+    assert.equal(path, "/api/v3/song/detail");
+    assert.deepEqual(JSON.parse(data.c), [{ id: 1 }, { id: 4 }, { id: 2 }, { id: 3 }]);
+    return response({ code: 200, songs: [song(2), song(1), song(3)], privileges: [
+      { id: 1, st: 0, pl: 320000 }, { id: 2, st: -1, pl: 0 }, { id: 3, st: 0, pl: 320000 },
+    ] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  storage.set("recent:7", [{ id: "1", at: 3 }, { id: "4", at: 2 }, { id: "1", at: 1 }, { id: "bad", at: 0 }]);
+  const tracks = await plugin.recent();
+  assert.deepEqual(requests, ["/api/play-record/song/list", "/api/v3/song/detail"]);
+  assert.deepEqual(tracks.map((track) => track.id), ["1", "2", "3"]);
+  assert.deepEqual(tracks.map((track) => track.unavailable), [false, true, false]);
+});
+
+// Nothing to show means nothing to ask for, with no session and no local plays.
+test("recent asks nothing until there is a history or a service list", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async () => { calls++; return response({ code: 200 }); });
+  assert.deepEqual(await plugin.recent(), []);
+  assert.equal(calls, 0);
+});
+
+// A cloud failure must not hide what this machine played; the page says so
+// instead of looking empty.
+test("recent keeps local plays when the service list fails and the page says so", async () => {
+  const { plugin, storage } = await setup(async (url) => {
+    if (url.includes("play-record")) return response({ code: 500 });
+    return response({ code: 200, songs: [song(1)], privileges: [{ id: 1, st: 0, pl: 320000 }] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  storage.set("recent:7", [{ id: "1", at: 2 }]);
+  const page = await plugin.browse({ page: "recent" });
+  assert.equal(page.title, "最近播放");
+  assert.match(page.subtitle, /云端播放记录暂时无法加载/);
+  assert.deepEqual(page.sections[0].tracks.map((track) => track.id), ["1"]);
+  assert.ok(page.sections[0].empty.includes("还没有播放记录"));
+});
+
+// A sign-out mid-flight makes the response belong to the previous account.
+test("a sign-out during the service list rejects its stale history", async () => {
+  let finish;
+  const { plugin, storage } = await setup((url) => {
+    if (url.includes("play-record")) return new Promise((resolve) => { finish = resolve; });
+    throw new Error(`unexpected request: ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  storage.set("recent:7", [{ id: "1", at: 2 }]);
+  const pending = plugin.recent();
+  plugin.signOut();
+  finish(response({ code: 200, data: { list: [{ data: song(1) }] } }));
+  await assert.rejects(pending, /账号状态已改变/);
+});
+
+// An expired login on the history page must reach the host's sign-in prompt.
+test("an expired login keeps its sign-in prompt on the recent page", async () => {
+  const { plugin } = await setup(async (url) => url.includes("play-record")
+    ? response({ code: 301 })
+    : response({ code: 200 }),
+  { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  await assert.rejects(plugin.recent(), { code: "signIn" });
+});
+
+// Prefetching the next song is not playing it: only the host's played
+// callback may write history.
+test("fetching a source leaves the play history alone", async () => {
+  const { plugin, storage } = await setup(async () => response({ code: 200, data: [
+    { id: 1, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh", size: 10, br: 320000 },
+  ] }), { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7", name: "Fixture" } });
+  await plugin.stream({ id: "1" });
+  assert.equal(storage.has("recent:7"), false);
+});
+
+// The page needs a visible entry, not only the export the host may not use.
+test("the sidebar has a visible recent page", async () => {
+  const manifest = JSON.parse(await readFile(new URL("./plugin.json", import.meta.url), "utf8"));
+  const entry = manifest.navigation.find((item) => item.page === "recent");
+  assert.ok(entry);
+  assert.equal(entry.title, "最近播放");
 });

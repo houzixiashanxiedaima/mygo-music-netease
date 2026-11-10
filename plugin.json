@@ -1,7 +1,7 @@
 {
   "id": "netease",
   "name": "网易云音乐",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minAppVersion": "0.1.20",
   "main": "index.js",
   "playback": "stream",
@@ -12,6 +12,7 @@
     { "title": "发现音乐", "builtin": "home" },
     { "title": "私人漫游", "builtin": "stations" },
     { "title": "排行榜", "page": "charts", "icon": "chart" },
+    { "title": "最近播放", "page": "recent", "icon": "calendar" },
     { "title": "我喜欢的音乐", "builtin": "liked" },
     { "title": "我的播客", "builtin": "shows" }
   ]
