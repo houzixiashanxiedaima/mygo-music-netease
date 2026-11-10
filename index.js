@@ -10,6 +10,10 @@ const EAPI_KEY = "e82ckenh8dichen8";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 const EAPI_UA = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
 const PAGE_SIZE = 30;
+const PODCAST_LIMIT = 30;
+// A page name carries the hot-podcast offset. Bound it so a made-up page
+// cannot ask for an arbitrarily deep list.
+const PODCAST_OFFSET_LIMIT = 10000;
 const PLAYLIST_LIMIT = 1000;
 const PRIVATE_RADAR = "3136952023";
 const COOKIE_NAMES = ["MUSIC_U", "__csrf", "NMTID"];
@@ -95,6 +99,18 @@ function idOf(value) {
     throw new Error("无效的网易云音乐 ID");
   }
   return id;
+}
+
+// Lists from NetEase can omit an ID or send one this plugin cannot open. Keep
+// a usable ID as a string, and let the caller leave the item out instead of
+// handing the host "undefined" or an empty ID.
+function externalID(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value > 0 ? String(value) : "";
+  }
+  if (typeof value !== "string") return "";
+  const id = value.trim();
+  return /^\d+$/.test(id) && Number.isSafeInteger(Number(id)) && Number(id) > 0 ? id : "";
 }
 
 function pageOffset(value) {
@@ -369,11 +385,23 @@ function toPlaylist(playlist) {
 }
 
 function toShow(show) {
+  const id = externalID(show?.id);
+  if (!id) return null;
   return {
-    id: String(show.id), name: show.name || "", imageUrl: artworkURL(show.picUrl),
-    description: show.desc || "", publisher: show.dj?.nickname || "",
+    id, name: show.name || "", imageUrl: artworkURL(show.picUrl),
+    description: show.desc || show.rcmdtext || "", publisher: show.dj?.nickname || "",
     episodeCount: show.programCount || 0, subscribed: !!show.subed,
   };
+}
+
+function toShows(items) {
+  if (!Array.isArray(items)) throw new Error("网易云返回了无效的播客列表，请稍后重试");
+  const seen = new Set();
+  return items.map(toShow).filter(show => {
+    if (!show || seen.has(show.id)) return false;
+    seen.add(show.id);
+    return true;
+  });
 }
 
 function toEpisode(program, show) {
@@ -534,7 +562,37 @@ export async function search({ query, kind = "tracks", offset = 0 }) {
   const result = data.result || {};
   const items = result[type[1]] || [];
   const records = kind === "tracks" ? await songDetails(items.map((song) => song.id), items) : items;
-  return { [kind]: records.map(type[3]), more: items.length > 0 && offset + items.length < (result[type[2]] || 0) };
+  return { [kind]: records.map(type[3]).filter(Boolean), more: items.length > 0 && offset + items.length < (result[type[2]] || 0) };
+}
+
+// The host's suggest contract is a ranked list of strings, while NetEase
+// answers groups by kind. Flatten them in NetEase's order, drop blanks and
+// repeats, and cap the list the host shows. The host already ignores a late
+// answer once the query changed, so no extra request sequence is kept here.
+export async function suggest({ query }) {
+  const text = String(query || "").trim();
+  if (!text) return [];
+  const data = await request("/api/search/suggest/web", { s: text });
+  const result = data.result || {};
+  const names = kind => Array.isArray(result[kind]) ? result[kind].map(item => item?.name) : [];
+  const groups = {
+    songs: names("songs"), artists: names("artists"),
+    albums: names("albums"), playlists: names("playlists"),
+  };
+  const order = Array.isArray(result.order) ? result.order : [];
+  const seen = new Set();
+  const suggestions = [];
+  for (const kind of [...order, "songs", "artists", "albums", "playlists"]) {
+    if (!Array.isArray(groups[kind])) continue;
+    for (const name of groups[kind]) {
+      const candidate = typeof name === "string" ? name.trim() : "";
+      if (!candidate || seen.has(candidate)) continue;
+      seen.add(candidate);
+      suggestions.push(candidate);
+      if (suggestions.length >= 10) return suggestions;
+    }
+  }
+  return suggestions;
 }
 
 async function discoveryPlaylists() {
@@ -563,6 +621,25 @@ async function discoverySection() {
   }
 }
 
+async function recommendedPodcasts() {
+  const data = await request("/api/djradio/recommend/v1");
+  return toShows(data.djRadios);
+}
+
+async function hotPodcasts(offset) {
+  const data = await request("/api/djradio/hot/v1", { limit: PODCAST_LIMIT, offset });
+  return { shows: toShows(data.djRadios), more: data.hasMore === true && data.djRadios.length > 0 };
+}
+
+// The host's Browse page has no offset of its own. Encode the hot list's
+// offset in the page name, and parse only a non-negative, bounded integer.
+function podcastHotOffset(page) {
+  const match = /^podcasts:hot:(\d+)$/.exec(page);
+  if (!match) return null;
+  const offset = Number(match[1]);
+  return Number.isSafeInteger(offset) && offset >= 0 && offset <= PODCAST_OFFSET_LIMIT ? offset : null;
+}
+
 export async function home() {
   const recommendations = await discoverySection();
   return {
@@ -572,6 +649,10 @@ export async function home() {
         { title: "每日推荐", subtitle: "每天更新，为你推荐好音乐", page: "daily", imageUrl: discoveryCover(0) },
         { title: "私人雷达", subtitle: "发现属于你的音乐", page: "radar", imageUrl: discoveryCover(1) },
         { title: "个性化歌单", subtitle: "网易云为你推荐的歌单", page: "recommendations", imageUrl: discoveryCover(2) },
+      ] },
+      { title: "播客发现", links: [
+        { title: "推荐播客", subtitle: "网易云为你推荐的播客", page: "podcasts:recommend" },
+        { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0" },
       ] },
       { title: "私人漫游", stations: stationList() },
       recommendations,
@@ -600,6 +681,35 @@ export async function browse({ page }) {
     await requireAccount();
     const data = await request("/api/v1/discovery/recommend/resource");
     return { title: "个性化歌单", sections: [{ playlists: (data.recommend || []).map(toPlaylist) }] };
+  }
+  if (page === "podcasts:recommend") {
+    return {
+      title: "推荐播客", subtitle: "网易云为你推荐的播客",
+      sections: [{ shows: await recommendedPodcasts(), empty: "暂时没有推荐播客" }],
+    };
+  }
+  const hotOffset = podcastHotOffset(page);
+  if (hotOffset !== null) {
+    const { shows, more } = await hotPodcasts(hotOffset);
+    const current = Math.floor(hotOffset / PODCAST_LIMIT) + 1;
+    const links = [];
+    if (hotOffset > 0) {
+      links.push({
+        title: "上一页", subtitle: `第 ${Math.max(1, Math.ceil(hotOffset / PODCAST_LIMIT))} 页`,
+        page: `podcasts:hot:${Math.max(0, hotOffset - PODCAST_LIMIT)}`,
+      });
+    }
+    const next = hotOffset + PODCAST_LIMIT;
+    if (more && next <= PODCAST_OFFSET_LIMIT) {
+      links.push({ title: "下一页", subtitle: `第 ${current + 1} 页`, page: `podcasts:hot:${next}` });
+    }
+    return {
+      title: "热门播客", subtitle: `第 ${current} 页`,
+      sections: [
+        { shows, empty: "暂时没有热门播客" },
+        ...(links.length ? [{ title: "翻页", links }] : []),
+      ],
+    };
   }
   if (page !== "charts") throw fail("unsupported", "没有这个页面");
   const data = await request("/api/toplist/detail");
@@ -640,7 +750,11 @@ export async function shows() {
     const data = await request("/api/djradio/get/subed", { limit: 100, offset, total: "true" });
     const items = data.djRadios || [];
     const previousSize = result.size;
-    for (const item of items) result.set(String(item.id), { ...toShow(item), subscribed: true });
+    for (const item of items) {
+      const show = toShow(item);
+      if (!show) continue;
+      result.set(show.id, { ...show, subscribed: true });
+    }
     if (!data.hasMore) return [...result.values()];
     if (!items.length || result.size === previousSize) {
       throw new Error("网易云未返回完整的播客订阅列表，请稍后重试");
@@ -658,8 +772,10 @@ export async function show({ id, offset = 0 }) {
     request("/api/dj/program/byradio", { radioId: id, limit: PAGE_SIZE, offset, asc: "false" }),
   ]);
   if (!detail.data || String(detail.data.id) !== id) throw fail("unavailable", "播客不存在或当前账号无权访问");
+  const show = toShow(detail.data);
+  if (!show) throw fail("unavailable", "播客不存在或当前账号无权访问");
   return {
-    show: toShow(detail.data),
+    show,
     episodes: (programs.programs || []).map(program => toEpisode(program, detail.data)),
     more: !!programs.more,
   };

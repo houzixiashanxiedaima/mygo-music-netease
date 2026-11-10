@@ -144,6 +144,39 @@ test("search preserves order, pages, and uses the account's detail privileges", 
   assert.equal(result.more, true);
 });
 
+// The host shows one ranked string per suggestion. NetEase groups them by
+// kind, so flatten in its order, drop blanks and repeats, and never turn a
+// missing name into "undefined".
+test("suggest maps NetEase groups to ranked, unique search strings", async () => {
+  const { plugin } = await setup(async (url) => {
+    assert.ok(url.includes("/api/search/suggest/web"));
+    assert.equal(new URL(url).searchParams.get("s"), "周杰");
+    return response({ code: 200, result: {
+      songs: [{ id: 1, name: "七里香" }, { id: 2, name: "同名" }, { id: 3 }],
+      artists: [{ id: 4, name: "周杰伦" }, { id: 5, name: "同名" }],
+      albums: [{ id: 6, name: "叶惠美" }],
+      playlists: [{ id: 7, name: "" }, { id: 8, name: "周杰伦歌单" }],
+      order: ["artists", "songs", "albums", "playlists"],
+    } });
+  });
+  assert.deepEqual(await plugin.suggest({ query: " 周杰 " }), ["周杰伦", "同名", "七里香", "叶惠美", "周杰伦歌单"]);
+});
+
+// An empty query must not ask the server, and the host needs no more than ten
+// options. The host already ignores a late answer after the query changes.
+test("suggest skips empty queries and caps the host's list", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async () => {
+    calls++;
+    return response({ code: 200, result: {
+      songs: Array.from({ length: 20 }, (_, i) => ({ id: i + 1, name: `Song ${i + 1}` })),
+    } });
+  });
+  assert.deepEqual(await plugin.suggest({ query: "   " }), []);
+  assert.equal(calls, 0);
+  assert.equal((await plugin.suggest({ query: "song" })).length, 10);
+});
+
 // A playlist can contain only a preview of the actual track list.
 test("playlist resolves trackIds beyond the preview and retains their order", async () => {
   const { plugin } = await setup(async (url) => url.includes("playlist/detail")
@@ -775,6 +808,32 @@ test("stream reports the quality the response proves", async () => {
   }
 });
 
+test("suggest ignores malformed and unknown groups without breaking valid candidates", async () => {
+  const { plugin } = await setup(async () => response({ code: 200, result: {
+    order: ["__proto__", "constructor", "songs", "artists"],
+    songs: { name: "Invalid list" }, artists: [{ name: "Valid artist" }],
+  } }));
+  assert.deepEqual(await plugin.suggest({ query: "test" }), ["Valid artist"]);
+});
+
+test("empty hot podcast pages stop advancing but keep the previous page", async () => {
+  const { plugin } = await setup(async () => response({ code: 200, djRadios: [], hasMore: true }));
+  const page = await plugin.browse({ page: "podcasts:hot:30" });
+  assert.deepEqual(page.sections[0].shows, []);
+  assert.deepEqual(page.sections[1].links.map(link => link.page), ["podcasts:hot:0"]);
+});
+
+test("podcast discovery rejects malformed lists and deduplicates valid IDs", async () => {
+  let invalid = true;
+  const { plugin } = await setup(async () => response({ code: 200, djRadios: invalid
+    ? { unexpected: true }
+    : [{ id: 11, name: "First" }, { id: 11, name: "Duplicate" }, null] }));
+  await assert.rejects(plugin.browse({ page: "podcasts:recommend" }), /无效的播客列表/);
+  invalid = false;
+  const page = await plugin.browse({ page: "podcasts:recommend" });
+  assert.deepEqual(page.sections[0].shows.map(show => show.name), ["First"]);
+});
+
 // Personal recommendations require a real session before making their requests.
 test("guests can discover entries but private recommendations ask for sign-in", async () => {
   let calls = 0;
@@ -787,6 +846,83 @@ test("guests can discover entries but private recommendations ask for sign-in", 
   for (const page of ["daily", "radar", "recommendations"]) await assert.rejects(plugin.browse({ page }), { code: "signIn" });
   await assert.rejects(plugin.stationNext({ id: "DEFAULT" }), { code: "signIn" });
   assert.equal(calls, 1);
+});
+
+// Discovery links keep Home to one request; the podcast pages load only when
+// the listener opens them.
+test("home links to podcast discovery without loading its shows", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async (url) => {
+    calls++;
+    assert.ok(url.includes("/api/personalized/playlist"));
+    return response({ code: 200, result: [] });
+  });
+  const home = await plugin.home();
+  const links = home.sections.flatMap((section) => section.links || []);
+  assert.ok(links.some((link) => link.page === "podcasts:recommend"));
+  assert.ok(links.some((link) => link.page === "podcasts:hot:0"));
+  assert.equal(calls, 1);
+});
+
+// Recommended and hot podcasts are public pages. The hot list pages by links
+// because the host's Browse page has no offset argument of its own.
+test("podcast discovery maps shows and pages the hot list with links", async () => {
+  const picture = "http://p2.music.126.net/show.jpg";
+  const { plugin } = await setup(async (url) => {
+    if (url.includes("djradio/recommend/v1")) {
+      return response({ code: 200, djRadios: [
+        { id: 11, name: "Show 11", picUrl: picture, desc: "About 11", dj: { nickname: "Host" }, programCount: 4, subed: true },
+        { id: 13, name: "Show 13", picUrl: picture, rcmdtext: "Why 13" },
+        { id: "", name: "No ID" },
+        { id: "not-a-number", name: "Bad ID" },
+        null,
+      ] });
+    }
+    const params = new URL(url).searchParams;
+    assert.equal(params.get("limit"), "30");
+    if (params.get("offset") === "30") {
+      return response({ code: 200, djRadios: [{ id: 12, name: "Show 12", picUrl: picture }], hasMore: true });
+    }
+    assert.equal(params.get("offset"), "0");
+    return response({ code: 200, djRadios: [], hasMore: false });
+  });
+
+  const recommended = await plugin.browse({ page: "podcasts:recommend" });
+  assert.deepEqual(recommended.sections[0].shows.map((show) => show.id), ["11", "13"]);
+  assert.equal(recommended.sections[0].shows[0].description, "About 11");
+  assert.equal(recommended.sections[0].shows[1].description, "Why 13");
+  assert.equal(recommended.sections[0].shows[0].publisher, "Host");
+  assert.equal(recommended.sections[0].shows[0].episodeCount, 4);
+  assert.equal(recommended.sections[0].shows[0].subscribed, true);
+  assert.equal(new URL(recommended.sections[0].shows[0].imageUrl).searchParams.get("param"), "{size}y{size}");
+
+  const first = await plugin.browse({ page: "podcasts:hot:0" });
+  assert.equal(first.subtitle, "第 1 页");
+  assert.equal(first.sections.length, 1);
+
+  const second = await plugin.browse({ page: "podcasts:hot:30" });
+  assert.equal(second.subtitle, "第 2 页");
+  assert.deepEqual(second.sections[0].shows.map((show) => show.id), ["12"]);
+  assert.deepEqual(second.sections[1].links.map((link) => link.page), ["podcasts:hot:0", "podcasts:hot:60"]);
+  assert.deepEqual(second.sections[1].links.map((link) => link.title), ["上一页", "下一页"]);
+});
+
+// A made-up page must not reach the server with a negative, fractional or
+// absurd offset.
+test("podcast pagination rejects pages outside its bounded offset", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async () => { calls++; return response({ code: 200 }); });
+  for (const page of ["podcasts:hot:-1", "podcasts:hot:1.5", "podcasts:hot:abc", "podcasts:hot:10001", "podcasts:hot:99999999999999999999"]) {
+    await assert.rejects(plugin.browse({ page }), { code: "unsupported" });
+  }
+  assert.equal(calls, 0);
+});
+
+// Discovery is optional, but an expired login must still reach the host's
+// sign-in flow instead of being hidden behind an empty section.
+test("podcast discovery keeps a sign-in failure", async () => {
+  const { plugin } = await setup(async () => response({ code: 301 }));
+  await assert.rejects(plugin.browse({ page: "podcasts:recommend" }), { code: "signIn" });
 });
 
 // Daily songs and each FM mode use their own endpoint and account-aware details.

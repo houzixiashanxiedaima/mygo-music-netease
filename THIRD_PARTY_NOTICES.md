@@ -8,7 +8,7 @@ The NetEase API protocol and data mappings are adapted from:
 - Original project: https://github.com/egoist/mygo-cloudmusic
 - Upstream author: egoist and contributors; preserved fork: sogud.
 - Reference commit: `b13f52a2a2ff0746502b85b9c4c7fa1e86a1c385`.
-- Files consulted: `internal/netease/eapi.go`, `auth.go`, `netease.go`, `catalog.go`, `podcast.go`, `subscriptions.go`.
+- Files consulted: `internal/netease/eapi.go`, `auth.go`, `netease.go`, `catalog.go`, `podcast.go`, `search_suggest.go`, `subscriptions.go`.
 - Upstream license: GNU Affero General Public License version 3.
 
 Modifications made on 2026-11-06: ported Go requests to MyGo Music's JavaScript
@@ -18,8 +18,9 @@ quality mapping, bounded playlist loading, session invalidation, domain
 validation, and tests. No Go code or upstream binaries are included in the plugin.
 
 Host API reference: https://github.com/egoist/mygo-music at
-`9c7f629ef202d66ee064ee9128c34b169b5e7215` (MyGo Music 0.1.6), especially its
-README, `examples/demo-plugin`, `internal/music/music.go`, and `internal/plugin`.
+`1af0d8efd77fdf630c27cfc635f12e9cb089ce10` (MyGo Music 0.1.22), especially its
+README, `examples/demo-plugin`, `internal/music/music.go`, `internal/plugin`,
+`internal/app/ui_browse.go`, and `internal/app/ui_suggest.go`.
 The host itself is licensed under AGPL-3.0 and is distributed separately.
 
 NetEase Cloud Music names and content belong to their respective owners. This
@@ -40,6 +41,12 @@ Playlist track editing is adapted from jieye666's contribution in
 https://github.com/sogud/mygo-music-netease/pull/6, commit
 `29c6cffd6990d527a3d9e46757824dc0f6903881` (AGPL-3.0-only), with
 current-session checks, podcast ID rejection, and conservative duplicate retry.
+
+Modifications made on 2026-11-10: added ranked search suggestions from
+`/api/search/suggest/web`, and public recommended and hot podcast discovery
+pages. The hot list encodes its offset in the host's Browse page name and pages
+with links, because the host has no offset argument for Browse. Invalid or
+missing external show IDs are omitted instead of being passed to the host.
 
 The unexposed heart-mode candidate is adapted from `HeartMode` in
 `internal/netease/radio.go` at the same preserved upstream commit. Its request
