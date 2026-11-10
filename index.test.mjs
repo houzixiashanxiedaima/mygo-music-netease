@@ -468,17 +468,84 @@ test("stream does not call an empty answer a permission problem", async () => {
 });
 
 // A content 401 must not sign the listener out: the session is still valid, and
-// signing out loses their library over one song the account may not open.
+// signing out loses their library over one song the account may not open. The
+// account endpoint is the only thing that can tell the two 401s apart.
+const ACCOUNT_OK = { code: 200, profile: { userId: 8, nickname: "Fixture" } };
+
 test("stream keeps the session when a content 401 comes back", async () => {
-  const { plugin, storage } = await setup(async (_url, init) => {
-    if (init.headers.Cookie !== undefined && !init.headers.Cookie.includes("MUSIC_U=synthetic-session")) {
-      throw new Error("session was lost");
+  let probes = 0;
+  const { plugin, storage } = await setup(async (url, init) => {
+    if (url.includes("/api/nuser/account/get")) {
+      probes++;
+      assert.match(init.headers.Cookie, /MUSIC_U=synthetic-session/);
+      return response(ACCOUNT_OK);
     }
     return response({ code: 401 });
   }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
   await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
   assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  assert.deepEqual(storage.get("streamLog").map(entry => entry.outcome), ["error"]);
   await assert.rejects(plugin.stream({ id: "2" }), { code: "unavailable" });
+});
+
+// A 401 with no account behind it is a real expiry: the listener has to be told
+// to sign in again, and the dead credentials must not stay in storage.
+test("content 401 without an account asks for sign-in and clears the session", async () => {
+  const { plugin, storage } = await setup(async (url) => url.includes("/api/nuser/account/get")
+    ? response({ code: 200 })
+    : response({ code: 401 }), { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "signIn" });
+  assert.equal(storage.has("session"), false);
+  assert.equal(await plugin.account(), null);
+});
+
+// The check must never become the sign-out it is meant to prevent: a network
+// failure, a refusal or even a 301 from the probe leaves the session alone.
+test("a content 401 whose account check cannot finish keeps the session", async () => {
+  for (const answer of [
+    () => { throw new Error("network down"); },
+    () => response({ code: 503 }),
+    () => response({ code: 460 }),
+    () => response({ code: 301 }),
+  ]) {
+    const { plugin, storage } = await setup(async (url) => url.includes("/api/nuser/account/get")
+      ? answer()
+      : response({ code: 401 }), { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+    assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+  }
+});
+
+// Every refusal in the window shares one check, so a queue of unavailable songs
+// does not add an account request per song.
+test("repeated content 401s in one window ask the account once", async () => {
+  let probes = 0;
+  const { plugin, storage } = await setup(async (url) => {
+    if (url.includes("/api/nuser/account/get")) {
+      probes++;
+      return response(ACCOUNT_OK);
+    }
+    return response({ code: 401 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+  await assert.rejects(plugin.stream({ id: "2" }), { code: "unavailable" });
+  assert.equal(probes, 1);
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+});
+
+// A 401 can also revoke the cookie. Taking it must not sign out on its own: the
+// deletion is kept in memory, the check runs without a cookie, and only its
+// answer clears the stored session.
+test("a content 401 that deletes the cookie signs out only after the account check", async () => {
+  const { plugin, storage } = await setup(async (url, init) => {
+    if (url.includes("/api/nuser/account/get")) {
+      assert.equal(init.headers.Cookie, undefined);
+      return response({ code: 200 });
+    }
+    return response({ code: 401 }, ["MUSIC_U=deleted; Max-Age=0; Path=/"]);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "signIn" });
+  assert.equal(storage.has("session"), false);
 });
 
 // Diagnostics are kept for reading later, so they are bounded and hold nothing

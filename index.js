@@ -23,6 +23,10 @@ const STREAM_ATTEMPTS = 2;
 const STREAM_RETRY_MS = 1000;
 // The last attempts kept for reading later, as a ring.
 const DIAGNOSTIC_LIMIT = 20;
+// A content 401 does not prove the login expired. One account check answers
+// for every 401 in this window, so a song the account may not open does not
+// add a request per refusal.
+const SESSION_PROBE_MS = 30000;
 
 // MyGo 0.1.6 loads a module while holding the storage mutex. Host calls must
 // happen inside an exported action, never during module initialization.
@@ -30,6 +34,10 @@ let session = null;
 let epoch = 0;
 let profileCheckedAt = 0;
 let likedCache = null;
+// The last answer to "does this session still have an account", and the check
+// still running, both keyed by the generation they were asked in.
+let probeRecord = null;
+let probeRun = null;
 const pendingStreams = new Map();
 let discoveryCovers = null;
 let heartState = null;
@@ -145,6 +153,8 @@ function clearSession() {
   epoch++;
   session = { cookies: {}, profile: null };
   profileCheckedAt = 0;
+  probeRecord = null;
+  probeRun = null;
   likedCache = null;
   pendingStreams.clear();
   heartState = null;
@@ -152,16 +162,18 @@ function clearSession() {
   host.storage.remove("session");
 }
 
-function acceptResponseCookies(response, activeSession) {
+// `persist` and `signOut` let a 401 take the server's cookie update without
+// acting on it: losing MUSIC_U there is answered by the account check below,
+// not by an immediate sign-out. Every other response keeps both defaults.
+function acceptResponseCookies(response, activeSession, { persist = true, signOut = true } = {}) {
   const wasSignedIn = !!activeSession.cookies.MUSIC_U;
   acceptCookies(response, activeSession.cookies);
-  if (activeSession === session) {
-    if (wasSignedIn && !activeSession.cookies.MUSIC_U) {
-      clearSession();
-      throw fail("signIn", "网易云登录状态已失效，请重新登录");
-    }
-    persistSession();
+  if (activeSession !== session) return;
+  if (signOut && wasSignedIn && !activeSession.cookies.MUSIC_U) {
+    clearSession();
+    throw fail("signIn", "网易云登录状态已失效，请重新登录");
   }
+  if (persist) persistSession();
 }
 
 async function request(path, params = {}, options = {}) {
@@ -222,29 +234,64 @@ async function request(path, params = {}, options = {}) {
   if (!body || typeof body !== "object") throw new Error("网易云返回了无效数据");
   const code = Number(body.code);
   const allowed = options.codes || [200];
+  // A read-only request never answers with a cookie update: it asks a question
+  // and leaves the session exactly as it found it.
+  const readOnly = !!options.readOnly;
   if (!allowed.includes(code)) {
-    // NetEase answers 401 for content this account may not open while the
-    // session is still valid. Clearing it would sign the listener out over one
-    // song, so keep the session: only 301 and 302 say the login itself expired.
+    // NetEase answers 401 both for content this account may not open and for
+    // a login that really expired. Keep the cookie update, then ask the account
+    // endpoint which one it is; only 301 and 302 say it outright.
     if (code === 401) {
-      acceptResponseCookies(response, activeSession);
+      if (readOnly) throw fail("unavailable", "当前账号无权访问该内容");
+      acceptResponseCookies(response, activeSession, { persist: false, signOut: false });
+      if (await sessionExpired(activeSession, startedEpoch)) {
+        if (activeSession === session && startedEpoch === epoch) clearSession();
+        throw fail("signIn", "请重新登录网易云音乐");
+      }
       throw fail("unavailable", "当前账号无权访问该内容");
     }
     if ([301, 302].includes(code)) {
-      if (activeSession === session) clearSession();
+      if (!readOnly && activeSession === session) clearSession();
       throw fail("signIn", "请重新登录网易云音乐");
     }
     if (code === 460 || code === -460) {
       // A refused response can still renew NMTID. Keep the server's cookie
       // update for the same device/account retry, including session expiry.
-      acceptResponseCookies(response, activeSession);
+      if (!readOnly) acceptResponseCookies(response, activeSession);
       throw transientFailure(`网易云暂时拒绝了请求（${code}），请稍后重试`, code);
     }
     if (code === 405) throw transientFailure("网易云暂时限制了请求，请稍后再试");
     throw new Error(`网易云接口返回错误（${Number.isFinite(code) ? code : "未知"}）`);
   }
-  acceptResponseCookies(response, activeSession);
+  if (!readOnly) acceptResponseCookies(response, activeSession);
   return body;
+}
+
+// One account check answers every content 401 for the next SESSION_PROBE_MS.
+// Concurrent refusals share the check that is already running.
+function sessionExpired(activeSession, generation) {
+  const saved = probeRecord;
+  if (saved && saved.generation === generation && Date.now() - saved.at < SESSION_PROBE_MS) {
+    return Promise.resolve(saved.expired);
+  }
+  if (!probeRun || probeRun.generation !== generation) {
+    probeRun = { generation, promise: probeSession(activeSession, generation) };
+  }
+  return probeRun.promise;
+}
+
+async function probeSession(activeSession, generation) {
+  let expired = false;
+  try {
+    // profileFor is read-only here: a check that cannot finish changes nothing.
+    expired = !(await profileFor(activeSession, { readOnly: true }));
+  } catch {
+    // A timeout, a network error or 460 says nothing about the login. Only a
+    // success without a profile proves the session no longer has an account.
+    expired = false;
+  }
+  if (generation === epoch) probeRecord = { generation, at: Date.now(), expired };
+  return expired;
 }
 
 const eapi = (path, params, options = {}) => request(path, params, { ...options, eapi: true });
@@ -352,8 +399,8 @@ async function songDetails(ids, originals = [], options = {}) {
   });
 }
 
-async function profileFor(activeSession) {
-  const data = await request("/api/nuser/account/get", {}, { session: activeSession });
+async function profileFor(activeSession, options = {}) {
+  const data = await request("/api/nuser/account/get", {}, { session: activeSession, ...options });
   const profile = activeSession.cookies.MUSIC_U ? data.profile : null;
   return profile ? { id: String(profile.userId), name: profile.nickname, imageUrl: artworkURL(profile.avatarUrl) } : null;
 }
@@ -409,6 +456,8 @@ export async function signIn() {
       session = pending;
       heartState = null;
       pendingHeart = null;
+      probeRecord = null;
+      probeRun = null;
       profileCheckedAt = Date.now();
       likedCache = null;
       persistSession();
