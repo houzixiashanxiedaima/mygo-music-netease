@@ -52,6 +52,19 @@ const RECENT_GUEST = "guest";
 // for every 401 in this window, so a song the account may not open does not
 // add a request per refusal.
 const SESSION_PROBE_MS = 30000;
+// Optional home covers are read-only metadata: one short absolute budget for
+// all of them, at most two in flight, and one remembered answer per entry. A
+// picture is reused for a while; a failure or an empty list is remembered only
+// long enough to keep a double refresh from asking twice.
+const COVER_BUDGET_MS = 2500;
+const COVER_CONCURRENCY = 2;
+const COVER_TTL_MS = 5 * 60 * 1000;
+const COVER_FAILURE_TTL_MS = 30 * 1000;
+// The home entries that may carry a cover. Fixed, so the cache stays bounded.
+const COVER_ENTRIES = new Set([
+  "radar", "daily", "recommendations", "podcasts:recommend", "podcasts:hot:0", "recent",
+  "station:DEFAULT", "station:FAMILIAR", "station:EXPLORE",
+]);
 
 // MyGo 0.1.6 loads a module while holding the storage mutex. Host calls must
 // happen inside an exported action, never during module initialization.
@@ -74,6 +87,10 @@ let streamNextAllowedAt = 0;
 const streamCache = new Map();
 let heartState = null;
 let pendingHeart = null;
+// What each home entry last showed, and the optional run still asking. An
+// answer belongs to the session object and the generation that asked for it.
+const coverCache = new Map();
+let coverRun = null;
 
 function currentSession() {
   if (!session) session = host.storage.get("session") || { cookies: {}, profile: null };
@@ -227,6 +244,11 @@ function persistSession() {
   else host.storage.remove("session");
 }
 
+function resetCovers() {
+  coverCache.clear();
+  coverRun = null;
+}
+
 function resetStreamRequests() {
   pendingStreams.clear();
   streamCache.clear();
@@ -243,6 +265,7 @@ function clearSession() {
   probeRun = null;
   likedCache = null;
   resetStreamRequests();
+  resetCovers();
   heartState = null;
   pendingHeart = null;
   host.storage.remove("session");
@@ -628,6 +651,7 @@ export async function signIn() {
       if (startedEpoch !== epoch) break;
       session = pending;
       resetStreamRequests();
+      resetCovers();
       heartState = null;
       pendingHeart = null;
       probeRecord = null;
@@ -733,24 +757,174 @@ function podcastHotOffset(page) {
   return Number.isSafeInteger(offset) && offset >= 0 && offset <= PODCAST_OFFSET_LIMIT ? offset : null;
 }
 
+// A picture the host can load: HTTP(S) only, with the same size template as
+// every other artwork this plugin returns.
+function coverURL(value) {
+  const picture = secureURL(value);
+  if (!picture) return "";
+  try {
+    const url = new URL(picture);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return "";
+  } catch {
+    return "";
+  }
+  return artworkURL(picture);
+}
+
+// undefined means nothing is known about this entry yet; "" means it was
+// looked at and had no picture.
+function coverFor(entry, activeSession, generation) {
+  const saved = coverCache.get(entry);
+  if (!saved || saved.session !== activeSession || saved.generation !== generation) return undefined;
+  if (Date.now() - saved.at >= saved.ttl) return undefined;
+  return saved.imageUrl;
+}
+
+// A late answer must never describe a later session: write only while the
+// session object and the generation are still the ones that asked.
+function rememberCover(entry, picture, activeSession, generation) {
+  if (!COVER_ENTRIES.has(entry)) return;
+  if (activeSession !== session || generation !== epoch) return;
+  const imageUrl = coverURL(picture);
+  coverCache.set(entry, {
+    imageUrl, at: Date.now(), ttl: imageUrl ? COVER_TTL_MS : COVER_FAILURE_TTL_MS,
+    session: activeSession, generation,
+  });
+}
+
+// The first picture of a list that has one. Never a picture from another list.
+function firstListCover(items) {
+  for (const item of Array.isArray(items) ? items : []) {
+    const picture = coverURL(item?.coverImgUrl || item?.picUrl);
+    if (picture) return picture;
+  }
+  return "";
+}
+
+// Each entry reads only its own list. These are metadata reads: a cover never
+// costs the full page load, and a picture without one is simply left out.
+const COVER_SOURCES = {
+  radar: async (options) => {
+    // The radar playlist's own cover; n=1 keeps this to its metadata, not the
+    // batch track details a full page needs.
+    const data = await request("/api/v6/playlist/detail", { id: PRIVATE_RADAR, n: 1 }, options);
+    const radar = data.playlist;
+    if (!radar) return "";
+    const own = coverURL(radar.coverImgUrl || radar.picUrl);
+    if (own) return own;
+    // Otherwise the first song of this same playlist that has a picture.
+    for (const track of Array.isArray(radar.tracks) ? radar.tracks : []) {
+      const picture = coverURL(track?.al?.picUrl || track?.album?.picUrl);
+      if (picture) return picture;
+    }
+    return "";
+  },
+  daily: async (options) => {
+    const data = await request("/api/v3/discovery/recommend/songs", {}, options);
+    const songs = data.data?.dailySongs;
+    for (const song of Array.isArray(songs) ? songs : []) {
+      const picture = coverURL(song?.al?.picUrl || song?.album?.picUrl);
+      if (picture) return picture;
+    }
+    return "";
+  },
+  recommendations: async (options) =>
+    firstListCover((await request("/api/v1/discovery/recommend/resource", {}, options)).recommend),
+  "podcasts:recommend": async (options) =>
+    firstListCover((await request("/api/djradio/recommend/v1", {}, options)).djRadios),
+  "podcasts:hot:0": async (options) =>
+    firstListCover((await request("/api/djradio/hot/v1", { limit: PODCAST_LIMIT, offset: 0 }, options)).djRadios),
+};
+
+// Public lists are always asked for. A personal list is asked for only when
+// this plugin can name the account: a cookie with no known profile cannot be
+// attributed, so its cover is left out instead of guessed.
+function homeCoverEntries(activeSession) {
+  const entries = ["podcasts:recommend", "podcasts:hot:0"];
+  if (activeSession.cookies.MUSIC_U && activeSession.profile?.id) {
+    entries.unshift("radar", "daily", "recommendations");
+  }
+  return entries;
+}
+
+// A read-only request with nobody to answer to: no picture, no error, and a
+// short memory of the failure so the next home load does not ask again.
+async function fetchCover(entry, activeSession, generation, deadline) {
+  let picture = "";
+  const source = COVER_SOURCES[entry];
+  if (source && deadline - Date.now() > 0) {
+    try {
+      picture = await source({ session: activeSession, readOnly: true, deadline });
+    } catch {
+      picture = "";
+    }
+  }
+  rememberCover(entry, picture, activeSession, generation);
+}
+
+// At most COVER_CONCURRENCY requests, all inside one absolute deadline. A task
+// that starts after the deadline records no picture and no request.
+async function runCoverTasks(entries, activeSession, generation, deadline) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(COVER_CONCURRENCY, entries.length) }, async () => {
+    while (next < entries.length) {
+      await fetchCover(entries[next++], activeSession, generation, deadline);
+    }
+  });
+  await Promise.all(workers);
+}
+
+// Concurrent home loads ask for the same optional pictures once. A run is
+// joined only by the session that started it, and a late answer still has to
+// pass the session and generation checks in rememberCover.
+async function prefetchCovers(entries, activeSession, generation) {
+  const missing = entries.filter((entry) => coverFor(entry, activeSession, generation) === undefined);
+  if (!missing.length) return;
+  if (coverRun && coverRun.session === activeSession && coverRun.generation === generation) {
+    await coverRun.promise;
+    return;
+  }
+  const run = { session: activeSession, generation, promise: null };
+  run.promise = runCoverTasks(missing, activeSession, generation, Date.now() + COVER_BUDGET_MS);
+  coverRun = run;
+  try {
+    await run.promise;
+  } finally {
+    if (coverRun === run) coverRun = null;
+  }
+}
+
 export async function home() {
-  const recommendations = await discoverySection();
+  const activeSession = currentSession();
+  const generation = epoch;
+  // The required discovery list keeps its old path; the optional covers have
+  // their own short budget and never delay it beyond that budget.
+  const [recommendations] = await Promise.all([
+    discoverySection(),
+    prefetchCovers(homeCoverEntries(activeSession), activeSession, generation),
+  ]);
+  // Each entry shows only its own cover. A known and expired entry is omitted
+  // rather than borrowed from a list that loaded.
+  const entry = (name, value) => {
+    const imageUrl = coverFor(name, activeSession, generation);
+    return imageUrl ? { ...value, imageUrl } : value;
+  };
   return {
     title: "发现音乐", subtitle: "网易云音乐 · 发现喜欢的音乐",
     sections: [
       { title: "为你推荐", links: [
-        { title: "每日推荐", subtitle: "每天更新，为你推荐好音乐", page: "daily" },
-        { title: "私人雷达", subtitle: "发现属于你的音乐", page: "radar" },
-        { title: "个性化歌单", subtitle: "网易云为你推荐的歌单", page: "recommendations" },
+        entry("daily", { title: "每日推荐", subtitle: "每天更新，为你推荐好音乐", page: "daily" }),
+        entry("radar", { title: "私人雷达", subtitle: "发现属于你的音乐", page: "radar" }),
+        entry("recommendations", { title: "个性化歌单", subtitle: "网易云为你推荐的歌单", page: "recommendations" }),
       ] },
       { title: "播客发现", links: [
-        { title: "推荐播客", subtitle: "网易云为你推荐的播客", page: "podcasts:recommend" },
-        { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0" },
+        entry("podcasts:recommend", { title: "推荐播客", subtitle: "网易云为你推荐的播客", page: "podcasts:recommend" }),
+        entry("podcasts:hot:0", { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0" }),
       ] },
       { title: "继续收听", links: [
-        { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent" },
+        entry("recent", { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent" }),
       ] },
-      { title: "私人漫游", stations: stationList() },
+      { title: "私人漫游", stations: stationList().map(station => entry(`station:${station.id}`, station)) },
       recommendations,
     ],
   };
@@ -763,30 +937,54 @@ export async function browse({ page }) {
   if (page === "radar") {
     // NetEase's dynamic playlist is selected for the signed-in listener.
     // Never label its anonymous response as someone's personal radar.
+    const activeSession = currentSession();
+    const generation = epoch;
     await requireAccount();
     const radar = await playlist({ id: PRIVATE_RADAR });
+    // Keep the cover this load already proved, so home reuses it. The radar's
+    // own cover first, then the first song of this same list that has one.
+    rememberCover("radar", radar.imageUrl || radar.tracks.find(track => track.album?.imageUrl)?.album.imageUrl,
+      activeSession, generation);
     return { title: "私人雷达", subtitle: radar.name, sections: [{ tracks: radar.tracks }] };
   }
   if (page === "daily") {
+    const activeSession = currentSession();
+    const generation = epoch;
     await requireAccount();
     const data = await request("/api/v3/discovery/recommend/songs");
     const songs = data.data?.dailySongs || [];
-    return { title: "每日推荐", sections: [{ tracks: (await songDetails(songs.map(song => song.id), songs)).map(toTrack) }] };
+    const tracks = (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
+    rememberCover("daily", tracks.find(track => track.album?.imageUrl)?.album.imageUrl, activeSession, generation);
+    return { title: "每日推荐", sections: [{ tracks }] };
   }
   if (page === "recommendations") {
+    const activeSession = currentSession();
+    const generation = epoch;
     await requireAccount();
     const data = await request("/api/v1/discovery/recommend/resource");
-    return { title: "个性化歌单", sections: [{ playlists: (data.recommend || []).map(toPlaylist) }] };
+    const playlists = (data.recommend || []).map(toPlaylist);
+    rememberCover("recommendations", playlists.find(item => item.imageUrl)?.imageUrl, activeSession, generation);
+    return { title: "个性化歌单", sections: [{ playlists }] };
   }
   if (page === "podcasts:recommend") {
+    const activeSession = currentSession();
+    const generation = epoch;
+    const shows = await recommendedPodcasts();
+    rememberCover("podcasts:recommend", shows.find(show => show.imageUrl)?.imageUrl, activeSession, generation);
     return {
       title: "推荐播客", subtitle: "网易云为你推荐的播客",
-      sections: [{ shows: await recommendedPodcasts(), empty: "暂时没有推荐播客" }],
+      sections: [{ shows, empty: "暂时没有推荐播客" }],
     };
   }
   const hotOffset = podcastHotOffset(page);
   if (hotOffset !== null) {
+    const activeSession = currentSession();
+    const generation = epoch;
     const { shows, more } = await hotPodcasts(hotOffset);
+    // Only the first page is the entry home links to.
+    if (hotOffset === 0) {
+      rememberCover("podcasts:hot:0", shows.find(show => show.imageUrl)?.imageUrl, activeSession, generation);
+    }
     const current = Math.floor(hotOffset / PODCAST_LIMIT) + 1;
     const links = [];
     if (hotOffset > 0) {
@@ -987,6 +1185,9 @@ export function played({ id }) {
   const entries = readRecent(owner).filter((entry) => entry.id !== value);
   entries.unshift({ id: value, at: Date.now() });
   host.storage.set(`recent:${owner}`, entries.slice(0, RECENT_LIMIT));
+  // The history moved, so its remembered cover may no longer be the first one.
+  // Drop it without asking NetEase: the next recent load proves a new one.
+  coverCache.delete("recent");
 }
 
 // The service's own list answers for every device. It is an eapi call, and
@@ -1033,7 +1234,10 @@ async function recentTracks() {
     ids.push(id);
     if (ids.length >= RECENT_LIMIT) break;
   }
-  if (!ids.length) return { tracks: [], note };
+  if (!ids.length) {
+    rememberCover("recent", "", activeSession, generation);
+    return { tracks: [], note };
+  }
   const byID = await detailSongs(ids, { session: activeSession });
   if (generation !== epoch || activeSession !== session) throw new Error("账号状态已改变，请重试");
   const tracks = [];
@@ -1041,6 +1245,9 @@ async function recentTracks() {
     const song = byID.get(id) || cloudSongs.get(id);
     if (song) tracks.push(toTrack(song));
   }
+  // This page loaded the songs itself, so its first real cover is knowledge
+  // about the recent entry. Showing an older picture needs no request.
+  rememberCover("recent", tracks.find(track => track.album?.imageUrl)?.album.imageUrl, activeSession, generation);
   return { tracks, note };
 }
 
@@ -1549,6 +1756,8 @@ async function heartNext() {
 export async function stationNext({ id }) {
   if (id === "HEART") return heartNext();
   if (!["DEFAULT", "FAMILIAR", "EXPLORE"].includes(id)) throw fail("unsupported", "没有这个漫游模式");
+  const activeSession = currentSession();
+  const generation = epoch;
   await requireAccount();
   const data = await eapi("/api/v1/radio/get", { mode: id, limit: 3 });
   const songs = data.data || [];
@@ -1566,5 +1775,10 @@ export async function stationNext({ id }) {
       throw fail("unavailable", "网易云的「个性化服务」已关闭。请在官方 App 的「设置 → 消息和隐私 → 个性化服务」中开启后重试。");
     }
   }
-  return (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
+  const tracks = (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
+  // A batch that loaded naturally proves this mode's own cover; nothing is
+  // fetched for the cover and other modes keep whatever they proved.
+  rememberCover(`station:${id}`, tracks.find(track => track.album?.imageUrl)?.album.imageUrl,
+    activeSession, generation);
+  return tracks;
 }

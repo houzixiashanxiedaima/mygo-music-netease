@@ -1202,9 +1202,10 @@ test("podcast discovery rejects malformed lists and deduplicates valid IDs", asy
 });
 
 // Personal recommendations require a real session before making their requests.
+// Home may ask for public lists, but never for a personal one it cannot attribute.
 test("guests can discover entries but private recommendations ask for sign-in", async () => {
-  let calls = 0;
-  const { plugin } = await setup(async () => { calls++; return response({ code: 200, result: [] }); });
+  const paths = [];
+  const { plugin } = await setup(async (url) => { paths.push(new URL(url).pathname); return response({ code: 200, result: [] }); });
   const home = await plugin.home();
   assert.ok(home.sections.some(section => section.links?.some(link => link.page === "daily")));
   const stations = await plugin.stations();
@@ -1212,40 +1213,316 @@ test("guests can discover entries but private recommendations ask for sign-in", 
   assert.ok(stations.every(station => station.description.includes("个性化服务")));
   for (const page of ["daily", "radar", "recommendations"]) await assert.rejects(plugin.browse({ page }), { code: "signIn" });
   await assert.rejects(plugin.stationNext({ id: "DEFAULT" }), { code: "signIn" });
-  assert.equal(calls, 1);
+  assert.deepEqual(paths.sort(), ["/api/djradio/hot/v1", "/api/djradio/recommend/v1", "/api/personalized/playlist"]);
 });
 
-// Navigation entries have no dedicated artwork. Do not borrow playlist
-// pictures, even if there is only one picture and every card would repeat it.
-test("functional entries omit borrowed covers while preserving real playlist artwork", async () => {
-  for (const count of [1, 24, 0]) {
-    let calls = 0;
-    const { plugin } = await setup(async (url) => {
-      calls++;
-      assert.ok(url.includes("/api/personalized/playlist"));
-      return response({ code: 200, result: Array.from({ length: count }, (_, id) => ({
-        id: id + 1, name: `Discovery ${id}`, picUrl: `http://p2.music.126.net/discovery-${id}.jpg`,
-      })) });
-    });
-    const home = await plugin.home();
-    const links = home.sections.flatMap(section => section.links || []);
-    const stations = home.sections.flatMap(section => section.stations || []);
-    assert.deepEqual(links.map(link => link.page), ["daily", "radar", "recommendations", "podcasts:recommend", "podcasts:hot:0", "recent"]);
-    assert.deepEqual(stations.map(station => station.id), ["DEFAULT", "FAMILIAR", "EXPLORE"]);
-    const entries = [...links, ...stations];
-    assert.equal(entries.filter(entry => !!entry.imageUrl).length, 0, "no unrelated covers on any of the nine entries");
-    assert.ok(entries.every(entry => !Object.hasOwn(entry, "imageUrl")));
-    assert.ok(entries.every(entry => entry.title || entry.name));
-    const playlists = home.sections.flatMap(section => section.playlists || []);
-    assert.equal(playlists.length, count);
-    for (let i = 0; i < count; i++) {
-      const cover = new URL(playlists[i].imageUrl);
-      assert.equal(cover.protocol, "https:");
-      assert.equal(cover.pathname, `/discovery-${i}.jpg`);
-      assert.equal(cover.searchParams.get("param"), "{size}y{size}");
+// Home entries carry their own list's cover. Nothing is borrowed from the
+// discovery playlists, and a personal entry a guest cannot name stays bare.
+test("home entries use only their own list's cover", async () => {
+  const picture = (name) => `http://p2.music.126.net/${name}.jpg`;
+  const { plugin } = await setup(async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/personalized/playlist") {
+      return response({ code: 200, result: [1, 24].map((id) => ({ id, name: `Discovery ${id}`, picUrl: picture("discovery") })) });
     }
-    assert.equal(calls, 1);
+    if (path === "/api/djradio/recommend/v1") return response({ code: 200, djRadios: [{ id: 11, name: "Show 11", picUrl: picture("recommend") }] });
+    if (path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [{ id: 12, name: "Show 12", picUrl: picture("hot") }] });
+    throw new Error(`unexpected request ${url}`);
+  });
+  const home = await plugin.home();
+  const links = home.sections.flatMap(section => section.links || []);
+  assert.deepEqual(links.map(link => link.page),
+    ["daily", "radar", "recommendations", "podcasts:recommend", "podcasts:hot:0", "recent"]);
+  const cover = (page) => new URL(links.find(link => link.page === page).imageUrl).pathname;
+  assert.equal(cover("podcasts:recommend"), "/recommend.jpg");
+  assert.equal(cover("podcasts:hot:0"), "/hot.jpg");
+  for (const page of ["daily", "radar", "recommendations", "recent"]) {
+    assert.ok(!Object.hasOwn(links.find(link => link.page === page), "imageUrl"), page);
   }
+  assert.ok(home.sections.flatMap(section => section.stations || []).every(station => !Object.hasOwn(station, "imageUrl")));
+  const playlists = home.sections.at(-1).playlists;
+  assert.equal(playlists.length, 2);
+  for (const playlist of playlists) {
+    const discovery = new URL(playlist.imageUrl);
+    assert.equal(discovery.pathname, "/discovery.jpg");
+    assert.equal(discovery.searchParams.get("param"), "{size}y{size}");
+  }
+});
+
+// A signed-in home asks each personal entry for its own metadata only: the
+// radar playlist (n=1), the daily list and the resource list.
+test("signed-in home covers come from each entry's own list", async () => {
+  const seen = [];
+  const { plugin, storage } = await setup(async (url, init) => {
+    const path = new URL(url).pathname;
+    seen.push(path);
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [{ id: 1, name: "Discovery", picUrl: "http://p1.music.126.net/discovery.jpg" }] });
+    if (path === "/api/v6/playlist/detail") {
+      const params = new URL(url).searchParams;
+      assert.equal(params.get("id"), "3136952023");
+      assert.equal(params.get("n"), "1");
+      assert.match(init.headers.Cookie, /MUSIC_U=synthetic-session/);
+      return response({ code: 200, playlist: { id: 3136952023, name: "Radar", tracks: [
+        { id: 1, al: {} }, { id: 2, al: { id: 6, picUrl: "http://p2.music.126.net/radar-song.jpg" } },
+      ] } });
+    }
+    if (path === "/api/v3/discovery/recommend/songs") return response({ code: 200, data: { dailySongs: [
+      { id: 3, name: "No cover" }, { id: 4, al: { id: 7, picUrl: "http://p3.music.126.net/daily.jpg" } },
+    ] } });
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 200, recommend: [
+      { id: 9, name: "First" }, { id: 10, name: "Second", coverImgUrl: "http://p4.music.126.net/resource.jpg" },
+    ] });
+    if (path === "/api/djradio/recommend/v1") return response({ code: 200, djRadios: [{ id: 11, picUrl: "http://p5.music.126.net/recommend.jpg" }] });
+    if (path === "/api/djradio/hot/v1") {
+      assert.equal(new URL(url).searchParams.get("offset"), "0");
+      return response({ code: 200, djRadios: [{ id: 12, picUrl: "http://p6.music.126.net/hot.jpg" }] });
+    }
+    throw new Error(`unexpected request ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  const links = (await plugin.home()).sections.flatMap(section => section.links || []);
+  const cover = (page) => {
+    const url = new URL(links.find(link => link.page === page).imageUrl);
+    assert.equal(url.searchParams.get("param"), "{size}y{size}");
+    return url.pathname;
+  };
+  // The radar playlist has no cover of its own here, so its first song with
+  // one answers; the daily list answers with its first valid song's album.
+  assert.equal(cover("radar"), "/radar-song.jpg");
+  assert.equal(cover("daily"), "/daily.jpg");
+  assert.equal(cover("recommendations"), "/resource.jpg");
+  assert.equal(cover("podcasts:recommend"), "/recommend.jpg");
+  assert.equal(cover("podcasts:hot:0"), "/hot.jpg");
+  // A cover is metadata: no track-detail batch, and read-only answers leave the
+  // session exactly as they found it.
+  assert.deepEqual(seen.filter(path => path === "/api/v3/song/detail"), []);
+  assert.equal(storage.get("session").cookies.MUSIC_U, "synthetic-session");
+});
+
+// A missing or non-web picture is no picture: the entry keeps its slot and
+// omits the field instead of falling back to another list.
+test("covers that are missing or not web pictures are left out", async () => {
+  const { plugin } = await setup(async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [{ id: 1, name: "Discovery" }] });
+    if (path === "/api/v6/playlist/detail") return response({ code: 200, playlist: { id: 3136952023,
+      coverImgUrl: "file:///tmp/radar.png", tracks: [null, { id: 1, al: { picUrl: "data:image/png;base64,fixture" } }] } });
+    if (path === "/api/v3/discovery/recommend/songs") return response({ code: 200, data: { dailySongs: [{ id: 1, al: { picUrl: "not a URL" } }] } });
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 200, recommend: [{ id: 9, coverImgUrl: "" }, null] });
+    if (path === "/api/djradio/recommend/v1") return response({ code: 200, djRadios: [{ id: 11, picUrl: "" }] });
+    if (path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    throw new Error(`unexpected request ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  const home = await plugin.home();
+  const entries = [...home.sections.flatMap(section => section.links || []), ...home.sections.flatMap(section => section.stations || [])];
+  assert.equal(entries.length, 9);
+  assert.ok(entries.every(entry => !Object.hasOwn(entry, "imageUrl")));
+  assert.equal(home.sections.at(-1).playlists[0].imageUrl, "");
+});
+
+// One failing or refused cover must not break home or the other entries, and
+// the two windows decide when the same entry is asked again.
+test("a failed cover stays local and recovers after its short window", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let dailyCalls = 0;
+  let hotCalls = 0;
+  const { plugin, storage } = await setup(async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/v6/playlist/detail") return response({ code: 200, playlist: { id: 3136952023, coverImgUrl: "http://p2.music.126.net/radar.jpg" } });
+    if (path === "/api/v3/discovery/recommend/songs") {
+      dailyCalls++;
+      return dailyCalls === 1 ? response({ code: 500 })
+        : response({ code: 200, data: { dailySongs: [{ id: 4, al: { picUrl: "http://p3.music.126.net/daily.jpg" } }] } });
+    }
+    // A read-only cover that looks like an expired login must not sign out.
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 301 });
+    if (path === "/api/djradio/recommend/v1") return response({ code: 200, djRadios: [{ id: 11, picUrl: "http://p5.music.126.net/recommend.jpg" }] });
+    if (path === "/api/djradio/hot/v1") {
+      hotCalls++;
+      return response({ code: 200, djRadios: [{ id: 12, picUrl: "http://p6.music.126.net/hot.jpg" }] });
+    }
+    throw new Error(`unexpected request ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  const link = (home, page) => home.sections.flatMap(section => section.links || []).find(item => item.page === page);
+  const first = await plugin.home();
+  assert.equal(new URL(link(first, "radar").imageUrl).pathname, "/radar.jpg");
+  assert.equal(new URL(link(first, "podcasts:recommend").imageUrl).pathname, "/recommend.jpg");
+  assert.equal(new URL(link(first, "podcasts:hot:0").imageUrl).pathname, "/hot.jpg");
+  assert.ok(!Object.hasOwn(link(first, "daily"), "imageUrl"));
+  assert.ok(!Object.hasOwn(link(first, "recommendations"), "imageUrl"));
+  assert.equal(storage.has("session"), true);
+  assert.deepEqual([dailyCalls, hotCalls], [1, 1]);
+  // Inside the failure window the refused and failed entries are not retried,
+  // and the successful covers are reused.
+  await plugin.home();
+  assert.deepEqual([dailyCalls, hotCalls], [1, 1]);
+  t.mock.timers.tick(30000);
+  const recovered = await plugin.home();
+  assert.equal(dailyCalls, 2);
+  assert.equal(new URL(link(recovered, "daily").imageUrl).pathname, "/daily.jpg");
+  assert.equal(hotCalls, 1);
+  // After the success window the cover is asked again, not kept forever.
+  t.mock.timers.tick(5 * 60 * 1000);
+  await plugin.home();
+  assert.equal(hotCalls, 2);
+});
+
+// Optional covers fill in behind the page: two at a time, and never past one
+// short budget. Later entries are left without a cover instead of waiting.
+test("optional covers stay within two requests and one short budget", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  let calls = 0;
+  let active = 0;
+  let peak = 0;
+  const { plugin } = await setup(async (url, init) => {
+    if (new URL(url).pathname === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    calls++;
+    active++;
+    peak = Math.max(peak, active);
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener("abort", () => { active--; reject(new Error("aborted")); }, { once: true });
+    });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  const started = Date.now();
+  const loading = plugin.home();
+  await flush();
+  t.mock.timers.tick(2500);
+  await flush();
+  const home = await loading;
+  assert.equal(Date.now() - started, 2500);
+  assert.equal(calls, 2);
+  assert.equal(peak, 2);
+  const entries = [...home.sections.flatMap(section => section.links || []), ...home.sections.flatMap(section => section.stations || [])];
+  assert.equal(entries.length, 9);
+  assert.ok(entries.every(entry => !Object.hasOwn(entry, "imageUrl")));
+  // The failed window also stops an immediate second attempt.
+  await plugin.home();
+  await flush();
+  assert.equal(calls, 2);
+});
+
+// Two home loads at once are one set of optional requests.
+test("concurrent home loads share one cover prefetch", async () => {
+  const counts = new Map();
+  const { plugin } = await setup(async (url) => {
+    const path = new URL(url).pathname;
+    counts.set(path, (counts.get(path) || 0) + 1);
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/v6/playlist/detail") return response({ code: 200, playlist: { id: 3136952023, coverImgUrl: "http://p2.music.126.net/radar.jpg" } });
+    if (path === "/api/v3/discovery/recommend/songs") return response({ code: 200, data: { dailySongs: [{ id: 4, al: { picUrl: "http://p3.music.126.net/daily.jpg" } }] } });
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 200, recommend: [{ id: 9, coverImgUrl: "http://p4.music.126.net/resource.jpg" }] });
+    if (path === "/api/djradio/recommend/v1") return response({ code: 200, djRadios: [{ id: 11, picUrl: "http://p5.music.126.net/recommend.jpg" }] });
+    if (path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [{ id: 12, picUrl: "http://p6.music.126.net/hot.jpg" }] });
+    throw new Error(`unexpected request ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  const [first, second] = await Promise.all([plugin.home(), plugin.home()]);
+  for (const path of ["/api/v6/playlist/detail", "/api/v3/discovery/recommend/songs", "/api/v1/discovery/recommend/resource", "/api/djradio/recommend/v1", "/api/djradio/hot/v1"]) {
+    assert.equal(counts.get(path), 1, path);
+  }
+  for (const home of [first, second]) {
+    const links = home.sections.flatMap(section => section.links || []);
+    // Every entry with its own source has a cover; the recent entry loaded no
+    // content here, so it keeps its slot without a picture.
+    assert.deepEqual(links.filter(link => link.imageUrl).map(link => link.page),
+      ["daily", "radar", "recommendations", "podcasts:recommend", "podcasts:hot:0"]);
+  }
+});
+
+// A cover asked for during a QR login belongs to the session that asked. The
+// confirmation replaces the session object without a new generation, so only
+// the identity check keeps that late answer out of the new account's cache.
+test("a cover earned before a QR confirmation is not reused afterwards", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 10000 });
+  let radarCalls = 0;
+  let finishRadar;
+  const { plugin } = await setup(async (url) => {
+    const path = new URL(url).pathname;
+    if (url.includes("/qrcode/unikey")) return response({ code: 200, unikey: "fixture-key" });
+    if (url.includes("/qrcode/client/login")) return response({ code: 803 }, ["MUSIC_U=synthetic-next; Path=/"]);
+    if (path === "/api/nuser/account/get") return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/v6/playlist/detail") {
+      radarCalls++;
+      const body = { code: 200, playlist: { id: 3136952023, coverImgUrl: "http://p2.music.126.net/radar.jpg" } };
+      return radarCalls === 1 ? new Promise(resolve => { finishRadar = () => resolve(response(body)); }) : response(body);
+    }
+    if (path === "/api/v3/discovery/recommend/songs") return response({ code: 200, data: { dailySongs: [] } });
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 200, recommend: [] });
+    if (path === "/api/djradio/recommend/v1") return response({ code: 200, djRadios: [] });
+    if (path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    throw new Error(`unexpected request ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-old" }, profile: { id: "7" } });
+  const login = plugin.signIn();
+  await flush();
+  const loading = plugin.home();
+  await flush();
+  assert.equal(typeof finishRadar, "function");
+  t.mock.timers.tick(1500);
+  await flush();
+  await login;
+  finishRadar();
+  const stale = await loading;
+  const staleEntries = [...stale.sections.flatMap(section => section.links || []),
+    ...stale.sections.flatMap(section => section.stations || [])];
+  assert.ok(staleEntries.every(entry => !Object.hasOwn(entry, "imageUrl")));
+  // The new account asks again instead of inheriting the old answer.
+  const fresh = await plugin.home();
+  assert.equal(radarCalls, 2);
+  const radar = fresh.sections.flatMap(section => section.links || []).find(link => link.page === "radar");
+  assert.equal(new URL(radar.imageUrl).pathname, "/radar.jpg");
+});
+
+// Recent history and the radio modes show a cover only after that content
+// loaded by itself. Their own load proves it; nothing is fetched for a cover.
+test("recent and radio covers come only from content that loaded", async () => {
+  const requests = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.startsWith("https://interfacepc.music.163.com")) {
+      const { path, data } = decode(init.body);
+      requests.push(path);
+      if (path === "/api/v1/radio/get") {
+        return response({ code: 200, data: [{ ...song(3), al: { id: 6, picUrl: `http://p1.music.126.net/mode-${data.mode}.jpg` } }] });
+      }
+      assert.equal(path, "/api/v3/song/detail");
+      const ids = JSON.parse(data.c).map(item => item.id);
+      return response({ code: 200, songs: ids.map(id => ({ ...song(id), al: { id: 6, picUrl: `http://p1.music.126.net/cover-${id}.jpg` } })),
+        privileges: ids.map(id => ({ id, st: 0, pl: 320000 })) });
+    }
+    const path = new URL(url).pathname;
+    requests.push(path);
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/djradio/recommend/v1") return response({ code: 200, djRadios: [] });
+    if (path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    if (path === "/api/play-record/song/list") return response({ code: 200, data: { list: [] } });
+    if (path === "/api/nuser/account/get") return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    throw new Error(`unexpected request ${url}`);
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  const link = (home, page) => home.sections.flatMap(section => section.links || []).find(item => item.page === page);
+  const station = (home, id) => home.sections.flatMap(section => section.stations || []).find(item => item.id === id);
+  assert.equal((await plugin.stations()).length, 3);
+  assert.deepEqual(requests, []);
+  const initial = await plugin.home();
+  assert.ok(!requests.includes("/api/v1/radio/get"));
+  for (const id of ["DEFAULT", "FAMILIAR", "EXPLORE"]) assert.ok(!Object.hasOwn(station(initial, id), "imageUrl"));
+  assert.ok(!Object.hasOwn(link(initial, "recent"), "imageUrl"));
+  await plugin.stationNext({ id: "DEFAULT" });
+  plugin.played({ id: "4" });
+  await plugin.browse({ page: "recent" });
+  const loaded = await plugin.home();
+  // The mode's batch was loaded by its own page, so the cover of its first
+  // resolved song is what the entry remembers.
+  assert.equal(new URL(station(loaded, "DEFAULT").imageUrl).pathname, "/cover-3.jpg");
+  for (const id of ["FAMILIAR", "EXPLORE"]) assert.ok(!Object.hasOwn(station(loaded, id), "imageUrl"));
+  assert.equal(new URL(link(loaded, "recent").imageUrl).pathname, "/cover-4.jpg");
+  // A new local play moves the history on without asking anything, and the
+  // remembered recent cover is dropped rather than shown over a new first song.
+  const before = requests.length;
+  plugin.played({ id: "5" });
+  const moved = await plugin.home();
+  assert.ok(!Object.hasOwn(link(moved, "recent"), "imageUrl"));
+  // The required discovery list is the page's own load; no history, radio,
+  // detail or cover request is added for the picture.
+  assert.deepEqual(requests.slice(before), ["/api/personalized/playlist"]);
 });
 
 test("listing radio modes does not fetch unrelated playlist artwork", async () => {
