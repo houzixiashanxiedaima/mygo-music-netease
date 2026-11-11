@@ -1735,6 +1735,68 @@ test("a recent picture earned before a QR confirmation is not stored for the new
   assert.equal(storage.has("covers:8"), false);
 });
 
+test("cloud-only recent artwork survives a module reload without inventing local plays", async () => {
+  const requests = [];
+  const fixture = { ...song(4), al: { id: 6, picUrl: "https://p1.music.126.net/cloud-4.jpg" } };
+  const { plugin, storage } = await setup(async (url) => {
+    const path = new URL(url).pathname.replace("/eapi/", "/api/"); requests.push(path);
+    if (path === "/api/nuser/account/get") return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (path === "/api/play-record/song/list") return response({ code: 200, data: { list: [{ data: fixture }] } });
+    if (path === "/api/v3/song/detail") return response({ code: 200, songs: [fixture], privileges: [{ id: 4, st: 0, pl: 320000 }] });
+    return response({ code: 200, result: [], playlist: { tracks: [] }, data: { dailySongs: [] }, recommend: [], djRadios: [] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  assert.equal((await plugin.recent()).length, 1);
+  assert.equal(storage.has("recent:8"), false);
+  const before = requests.length;
+  const cover = home => home.sections.flatMap(section => section.links || []).find(link => link.page === "recent").imageUrl;
+  assert.equal(new URL(cover(await plugin.home())).pathname, "/cloud-4.jpg");
+  const restarted = await import(`./index.js?test=${++sequence}`);
+  assert.equal(new URL(cover(await restarted.home())).pathname, "/cloud-4.jpg");
+  assert.ok(!requests.slice(before).includes("/api/play-record/song/list"));
+  assert.equal(storage.has("recent:8"), false);
+});
+
+test("late catalogue metadata cannot seed the next account's played cover", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 10000 });
+  let finishOld; let currentDetails = 0;
+  const { plugin } = await setup(async (url, init) => {
+    const path = new URL(url).pathname.replace("/eapi/", "/api/");
+    if (url.includes("/qrcode/unikey")) return response({ code: 200, unikey: "synthetic-qr-key" });
+    if (url.includes("/qrcode/client/login")) return response({ code: 803 }, ["MUSIC_U=synthetic-next; Path=/"]);
+    if (path === "/api/nuser/account/get") return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (path === "/api/cloudsearch/pc") return response({ code: 200, result: { songs: [song(4)], songCount: 1 } });
+    if (path === "/api/v3/song/detail") {
+      const picture = old => response({ code: 200, songs: [{ ...song(4), al: { id: 6, picUrl: `https://p1.music.126.net/${old ? "old" : "new"}-4.jpg` } }], privileges: [{ id: 4, st: 0, pl: 320000 }] });
+      if (init.headers.Cookie.includes("MUSIC_U=synthetic-old")) return new Promise(resolve => { finishOld = () => resolve(picture(true)); });
+      currentDetails++; return picture(false);
+    }
+    return response({ code: 200, result: [], playlist: { tracks: [] }, data: { dailySongs: [] }, recommend: [], djRadios: [] });
+  }, { cookies: { MUSIC_U: "synthetic-old" }, profile: { id: "7" } });
+  const signing = plugin.signIn(); await flush();
+  const oldSearch = plugin.search({ query: "fixture", kind: "tracks" }); await flush();
+  assert.equal(typeof finishOld, "function");
+  t.mock.timers.tick(1500); await flush(); await signing;
+  finishOld(); await oldSearch;
+  plugin.played({ id: "4" });
+  const link = (await plugin.home()).sections.flatMap(section => section.links || []).find(item => item.page === "recent");
+  assert.equal(new URL(link.imageUrl).pathname, "/new-4.jpg");
+  assert.equal(currentDetails, 1, "the new account must prove the picture for itself");
+});
+
+test("recent single-song artwork ignores extra records for other song IDs", async () => {
+  const { plugin } = await setup(async (url) => {
+    const path = new URL(url).pathname.replace("/eapi/", "/api/");
+    if (path === "/api/v3/song/detail") return response({ code: 200, songs: [
+      { ...song(5), al: { picUrl: "https://p1.music.126.net/wrong-5.jpg" } },
+      { ...song(4), al: { picUrl: "https://p1.music.126.net/right-4.jpg" } },
+    ] });
+    return response({ code: 200, result: [], playlist: { tracks: [] }, data: { dailySongs: [] }, recommend: [], djRadios: [] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } });
+  plugin.played({ id: "4" });
+  const link = (await plugin.home()).sections.flatMap(section => section.links || []).find(item => item.page === "recent");
+  assert.equal(new URL(link.imageUrl).pathname, "/right-4.jpg");
+});
+
 test("listing radio modes does not fetch unrelated playlist artwork", async () => {
   let calls = 0;
   const { plugin } = await setup(async () => { calls++; throw new Error("unexpected request"); });

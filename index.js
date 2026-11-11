@@ -500,8 +500,6 @@ function toAlbum(album = {}) {
 function toTrack(track) {
   const privilege = track.privilege;
   const album = toAlbum(track.al || track.album);
-  // A picture seen in metadata is what a later local play reuses locally.
-  rememberSongCover(String(track.id), album.imageUrl);
   return {
     id: String(track.id), name: track.name || "",
     artists: (track.ar || track.artists || []).map(toArtist),
@@ -586,6 +584,8 @@ function toComment(comment) {
 // not turn into a row the listener cannot open.
 async function detailSongs(ids, options = {}) {
   if (!ids.length) return new Map();
+  const activeSession = options.session || currentSession();
+  const generation = epoch;
   const batches = [];
   for (let offset = 0; offset < ids.length; offset += 400) {
     batches.push(ids.slice(offset, offset + 400));
@@ -595,7 +595,12 @@ async function detailSongs(ids, options = {}) {
     const privileges = new Map((data.privileges || []).map((p) => [String(p.id), p]));
     return (data.songs || []).map((song) => ({ ...song, privilege: privileges.get(String(song.id)) || song.privilege }));
   }));
-  return new Map(results.flat().map((song) => [String(song.id), song]));
+  const songs = results.flat();
+  // Record pictures at the request boundary, while their session is known.
+  // Conversion alone must stay pure: old results may be rendered after a QR
+  // confirmation replaced the session without changing the generation.
+  for (const song of songs) rememberSongCover(externalID(song.id), firstTrackCover([song]), activeSession, generation);
+  return new Map(songs.map((song) => [String(song.id), song]));
 }
 
 async function songDetails(ids, originals = [], options = {}) {
@@ -818,7 +823,8 @@ function rememberCover(entry, picture, activeSession, generation) {
 
 // Keep a picture this machine already saw for a song. Bounded by insertion
 // order, so an evening of listening cannot grow it without limit.
-function rememberSongCover(id, picture) {
+function rememberSongCover(id, picture, activeSession, generation) {
+  if (activeSession !== session || generation !== epoch) return;
   const imageUrl = coverURL(picture);
   if (!id || !imageUrl) return;
   songCovers.delete(id);
@@ -932,12 +938,13 @@ async function fillRecentCover(activeSession, generation, deadline) {
     return;
   }
   const missedAt = recentCoverMisses.get(songID);
-  if (missedAt && Date.now() - missedAt < COVER_FAILURE_TTL_MS) return;
+  if (missedAt !== undefined && Date.now() - missedAt < COVER_FAILURE_TTL_MS) return;
   if (deadline - Date.now() <= 0) return;
   let picture = "";
   try {
     const songs = await detailSongs([songID], { session: activeSession, readOnly: true, deadline });
-    picture = firstTrackCover([...songs.values()]);
+    const requested = songs.get(songID);
+    picture = requested ? firstTrackCover([requested]) : "";
   } catch {
     picture = "";
   }
@@ -951,7 +958,7 @@ async function fillRecentCover(activeSession, generation, deadline) {
     while (recentCoverMisses.size > RECENT_MISS_LIMIT) recentCoverMisses.delete(recentCoverMisses.keys().next().value);
     return;
   }
-  rememberSongCover(songID, picture);
+  rememberSongCover(songID, picture, activeSession, generation);
   rememberRecentCover(activeSession, generation, songID, picture);
 }
 
@@ -1003,9 +1010,9 @@ export async function home() {
   // previous session shows no stored picture either.
   const current = activeSession === session && generation === epoch;
   const memory = current ? readCoverMemory(recentOwner(activeSession)) : { recent: null, stations: {} };
-  const recentFirst = recentFirstID(activeSession);
   const entry = (name, value) => {
-    const imageUrl = coverFor(name, activeSession, generation);
+    const imageUrl = name === "recent" ? (current ? recentCoverFor(activeSession) : undefined)
+      : coverFor(name, activeSession, generation);
     return imageUrl ? { ...value, imageUrl } : value;
   };
   const remembered = (saved, value) => saved ? { ...value, imageUrl: saved.imageUrl } : value;
@@ -1022,8 +1029,7 @@ export async function home() {
         entry("podcasts:hot:0", { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0" }),
       ] },
       { title: "继续收听", links: [
-        remembered(recentFirst && memory.recent?.id === recentFirst ? memory.recent : null,
-          { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent" }),
+        entry("recent", { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent" }),
       ] },
       { title: "私人漫游", stations: stationList().map(station => remembered(memory.stations[station.id], station)) },
       recommendations,
@@ -1292,7 +1298,7 @@ function readCoverMemory(owner) {
   const recentID = externalID(saved.recent?.id);
   const recentPicture = coverURL(saved.recent?.imageUrl);
   if (recentID && recentPicture) {
-    memory.recent = { id: recentID, imageUrl: recentPicture, at: Number(saved.recent.at) || 0 };
+    memory.recent = { id: recentID, imageUrl: recentPicture, at: Number(saved.recent.at) || 0, cloud: saved.recent.cloud === true };
   }
   for (const mode of COVER_MEMORY_MODES) {
     const picture = coverURL(saved.stations?.[mode]?.imageUrl);
@@ -1314,20 +1320,24 @@ function recentCoverFor(activeSession) {
   const owner = recentOwner(activeSession);
   const first = owner ? readRecent(owner)[0]?.id : undefined;
   const saved = owner ? readCoverMemory(owner).recent : null;
-  return first && saved && saved.id === first ? saved.imageUrl : undefined;
+  if (!saved) return undefined;
+  // A cloud-only list was explicitly loaded, so its first picture is genuine
+  // recent content even before this machine has recorded a local play.
+  return (first ? saved.id === first : saved.cloud) ? saved.imageUrl : undefined;
 }
 
 // A picture may only be remembered for the song it came from, and only while
 // that song is still the newest local play. A slow answer for an older song
 // must not describe the newer one, even inside one session and one generation.
-function rememberRecentCover(activeSession, generation, songID, picture) {
+function rememberRecentCover(activeSession, generation, songID, picture, allowCloud = false) {
   if (activeSession !== session || generation !== epoch) return;
   const owner = recentOwner(activeSession);
   const id = externalID(songID);
   const imageUrl = coverURL(picture);
   if (!owner || !id || !imageUrl) return;
-  if (readRecent(owner)[0]?.id !== id) return;
-  writeCoverMemory(owner, (memory) => { memory.recent = { id, imageUrl, at: Date.now() }; });
+  const first = readRecent(owner)[0]?.id;
+  if (first !== id && !(allowCloud && !first)) return;
+  writeCoverMemory(owner, (memory) => { memory.recent = { id, imageUrl, at: Date.now(), cloud: !first }; });
 }
 
 function rememberStationCover(activeSession, generation, mode, picture) {
@@ -1412,10 +1422,13 @@ async function recentTracks() {
     const song = byID.get(id) || cloudSongs.get(id);
     if (song) tracks.push(toTrack(song));
   }
-  // This page loaded the songs itself, so the newest local play's picture is
-  // known: home reuses it, bound to that song ID.
-  const localTrack = localFirst ? tracks.find((track) => track.id === localFirst) : undefined;
-  if (localTrack) rememberRecentCover(activeSession, generation, localFirst, localTrack.album?.imageUrl);
+  // A natural recent-page load also proves cloud-only artwork. Do not create
+  // local listening records to keep that picture; if a new local play arrived
+  // in the meantime, rememberRecentCover rejects an older song's answer.
+  const representative = localFirst ? tracks.find(track => track.id === localFirst)
+    : tracks.find(track => coverURL(track.album?.imageUrl));
+  if (representative) rememberRecentCover(activeSession, generation, representative.id,
+    representative.album?.imageUrl, !localFirst);
   return { tracks, note };
 }
 
