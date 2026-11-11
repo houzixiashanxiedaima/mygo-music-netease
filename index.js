@@ -792,10 +792,27 @@ function rememberCover(entry, picture, activeSession, generation) {
   });
 }
 
-// The first picture of a list that has one. Never a picture from another list.
+function firstCover(...values) {
+  for (const value of values) {
+    const picture = coverURL(value);
+    if (picture) return picture;
+  }
+  return "";
+}
+
+// Validate each candidate before selecting it; a malformed primary field
+// must not hide a valid alternative or a later item of this same list.
 function firstListCover(items) {
   for (const item of Array.isArray(items) ? items : []) {
-    const picture = coverURL(item?.coverImgUrl || item?.picUrl);
+    const picture = firstCover(item?.coverImgUrl, item?.picUrl, item?.imageUrl);
+    if (picture) return picture;
+  }
+  return "";
+}
+
+function firstTrackCover(tracks) {
+  for (const track of Array.isArray(tracks) ? tracks : []) {
+    const picture = firstCover(track?.al?.picUrl, track?.album?.picUrl, track?.album?.imageUrl);
     if (picture) return picture;
   }
   return "";
@@ -810,23 +827,14 @@ const COVER_SOURCES = {
     const data = await request("/api/v6/playlist/detail", { id: PRIVATE_RADAR, n: 1 }, options);
     const radar = data.playlist;
     if (!radar) return "";
-    const own = coverURL(radar.coverImgUrl || radar.picUrl);
+    const own = firstCover(radar.coverImgUrl, radar.picUrl);
     if (own) return own;
     // Otherwise the first song of this same playlist that has a picture.
-    for (const track of Array.isArray(radar.tracks) ? radar.tracks : []) {
-      const picture = coverURL(track?.al?.picUrl || track?.album?.picUrl);
-      if (picture) return picture;
-    }
-    return "";
+    return firstTrackCover(radar.tracks);
   },
   daily: async (options) => {
     const data = await request("/api/v3/discovery/recommend/songs", {}, options);
-    const songs = data.data?.dailySongs;
-    for (const song of Array.isArray(songs) ? songs : []) {
-      const picture = coverURL(song?.al?.picUrl || song?.album?.picUrl);
-      if (picture) return picture;
-    }
-    return "";
+    return firstTrackCover(data.data?.dailySongs);
   },
   recommendations: async (options) =>
     firstListCover((await request("/api/v1/discovery/recommend/resource", {}, options)).recommend),
@@ -850,6 +858,9 @@ function homeCoverEntries(activeSession) {
 // A read-only request with nobody to answer to: no picture, no error, and a
 // short memory of the failure so the next home load does not ask again.
 async function fetchCover(entry, activeSession, generation, deadline) {
+  // A worker can be queued while the listener signs out or confirms a login.
+  if (activeSession !== session || generation !== epoch) return;
+  const previous = coverCache.get(entry);
   let picture = "";
   const source = COVER_SOURCES[entry];
   if (source && deadline - Date.now() > 0) {
@@ -859,7 +870,9 @@ async function fetchCover(entry, activeSession, generation, deadline) {
       picture = "";
     }
   }
-  rememberCover(entry, picture, activeSession, generation);
+  // A normal page load may have provided a newer answer while this preview
+  // was pending. An old success or failure must not overwrite that answer.
+  if (coverCache.get(entry) === previous) rememberCover(entry, picture, activeSession, generation);
 }
 
 // At most COVER_CONCURRENCY requests, all inside one absolute deadline. A task
@@ -943,7 +956,7 @@ export async function browse({ page }) {
     const radar = await playlist({ id: PRIVATE_RADAR });
     // Keep the cover this load already proved, so home reuses it. The radar's
     // own cover first, then the first song of this same list that has one.
-    rememberCover("radar", radar.imageUrl || radar.tracks.find(track => track.album?.imageUrl)?.album.imageUrl,
+    rememberCover("radar", firstCover(radar.imageUrl, firstTrackCover(radar.tracks)),
       activeSession, generation);
     return { title: "私人雷达", subtitle: radar.name, sections: [{ tracks: radar.tracks }] };
   }
@@ -954,7 +967,7 @@ export async function browse({ page }) {
     const data = await request("/api/v3/discovery/recommend/songs");
     const songs = data.data?.dailySongs || [];
     const tracks = (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
-    rememberCover("daily", tracks.find(track => track.album?.imageUrl)?.album.imageUrl, activeSession, generation);
+    rememberCover("daily", firstTrackCover(tracks), activeSession, generation);
     return { title: "每日推荐", sections: [{ tracks }] };
   }
   if (page === "recommendations") {
@@ -963,14 +976,14 @@ export async function browse({ page }) {
     await requireAccount();
     const data = await request("/api/v1/discovery/recommend/resource");
     const playlists = (data.recommend || []).map(toPlaylist);
-    rememberCover("recommendations", playlists.find(item => item.imageUrl)?.imageUrl, activeSession, generation);
+    rememberCover("recommendations", firstListCover(playlists), activeSession, generation);
     return { title: "个性化歌单", sections: [{ playlists }] };
   }
   if (page === "podcasts:recommend") {
     const activeSession = currentSession();
     const generation = epoch;
     const shows = await recommendedPodcasts();
-    rememberCover("podcasts:recommend", shows.find(show => show.imageUrl)?.imageUrl, activeSession, generation);
+    rememberCover("podcasts:recommend", firstListCover(shows), activeSession, generation);
     return {
       title: "推荐播客", subtitle: "网易云为你推荐的播客",
       sections: [{ shows, empty: "暂时没有推荐播客" }],
@@ -983,7 +996,7 @@ export async function browse({ page }) {
     const { shows, more } = await hotPodcasts(hotOffset);
     // Only the first page is the entry home links to.
     if (hotOffset === 0) {
-      rememberCover("podcasts:hot:0", shows.find(show => show.imageUrl)?.imageUrl, activeSession, generation);
+      rememberCover("podcasts:hot:0", firstListCover(shows), activeSession, generation);
     }
     const current = Math.floor(hotOffset / PODCAST_LIMIT) + 1;
     const links = [];
@@ -1247,7 +1260,7 @@ async function recentTracks() {
   }
   // This page loaded the songs itself, so its first real cover is knowledge
   // about the recent entry. Showing an older picture needs no request.
-  rememberCover("recent", tracks.find(track => track.album?.imageUrl)?.album.imageUrl, activeSession, generation);
+  rememberCover("recent", firstTrackCover(tracks), activeSession, generation);
   return { tracks, note };
 }
 
@@ -1778,7 +1791,7 @@ export async function stationNext({ id }) {
   const tracks = (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
   // A batch that loaded naturally proves this mode's own cover; nothing is
   // fetched for the cover and other modes keep whatever they proved.
-  rememberCover(`station:${id}`, tracks.find(track => track.album?.imageUrl)?.album.imageUrl,
+  rememberCover(`station:${id}`, firstTrackCover(tracks),
     activeSession, generation);
   return tracks;
 }

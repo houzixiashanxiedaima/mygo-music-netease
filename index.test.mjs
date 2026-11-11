@@ -1015,7 +1015,9 @@ test("a refusal cools down source fetches without blocking other APIs", async (t
   assert.equal(sourceCalls(), 1);
   const before = requests.length;
   await plugin.home();
-  assert.equal(requests.length, before + 1);
+  assert.deepEqual(requests.slice(before).map(url => new URL(url).pathname).sort(), [
+    "/api/personalized/playlist", "/api/djradio/recommend/v1", "/api/djradio/hot/v1",
+  ].sort(), "home metadata stays independent of the source cooldown");
   const second = plugin.stream({ id: "2" }).catch(error => error);
   await flush();
   assert.equal(sourceCalls(), 1, "next song still respects the shared cooldown");
@@ -1532,6 +1534,62 @@ test("listing radio modes does not fetch unrelated playlist artwork", async () =
   assert.equal(calls, 0);
   assert.deepEqual(stations.map(station => station.id), ["DEFAULT", "FAMILIAR", "EXPLORE"]);
   assert.ok(stations.every(station => !Object.hasOwn(station, "imageUrl")));
+});
+
+// Stale work must stop before sending the next request, not merely avoid
+// storing its eventual answer in the new account's cache.
+test("sign-out stops cover requests that are still queued", async () => {
+  const pending = []; let signedOut = false; const sentAfter = [];
+  const empty = () => response({ code: 200, result: [], playlist: {}, data: { dailySongs: [] }, recommend: [], djRadios: [] });
+  const { plugin } = await setup(async (url, init) => {
+    const path = new URL(url).pathname;
+    if (signedOut) sentAfter.push({ path, hasCredential: !!init.headers.Cookie });
+    if (!signedOut && path !== "/api/personalized/playlist") return new Promise(resolve => pending.push(() => resolve(empty())));
+    return empty();
+  }, { cookies: { MUSIC_U: "synthetic-old" }, profile: { id: "7" } });
+  const loading = plugin.home(); await flush();
+  assert.equal(pending.length, 2);
+  plugin.signOut(); signedOut = true;
+  for (const finish of pending) finish();
+  await loading;
+  assert.deepEqual(sentAfter, [], "queued work must not send the old account's credentials");
+});
+
+test("an older preview cannot erase a cover obtained by a newer page load", async () => {
+  let finish;
+  const { plugin } = await setup(async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/nuser/account/get") return response({ code: 200, profile: { userId: 7, nickname: "Fixture" } });
+    if (path === "/api/v6/playlist/detail") {
+      if (new URL(url).searchParams.get("n") === "1") return new Promise(resolve => { finish = () => resolve(response({ code: 200, playlist: { tracks: [] } })); });
+      return response({ code: 200, playlist: { id: 3136952023, name: "Radar", tracks: [], coverImgUrl: "https://p1.music.126.net/newer.jpg" } });
+    }
+    return response({ code: 200, data: { dailySongs: [] }, recommend: [], djRadios: [] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7" } });
+  const loading = plugin.home(); await flush();
+  assert.equal(typeof finish, "function");
+  await plugin.browse({ page: "radar" });
+  finish();
+  const links = (await loading).sections.flatMap(section => section.links || []);
+  assert.equal(new URL(links.find(item => item.page === "radar").imageUrl).pathname, "/newer.jpg");
+});
+
+test("cover selection tries valid alternative fields within the same content item", async () => {
+  const { plugin } = await setup(async (url) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/v6/playlist/detail") return response({ code: 200, playlist: { coverImgUrl: "file:///invalid", picUrl: "https://p1.music.126.net/radar-alt.jpg" } });
+    if (path === "/api/v3/discovery/recommend/songs") return response({ code: 200, data: { dailySongs: [{ al: { picUrl: "bad" }, album: { picUrl: "https://p1.music.126.net/daily-alt.jpg" } }] } });
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 200, recommend: [{ coverImgUrl: "data:bad", picUrl: "https://p1.music.126.net/list-alt.jpg" }] });
+    return response({ code: 200, djRadios: [] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "7" } });
+  const links = (await plugin.home()).sections.flatMap(section => section.links || []);
+  for (const [page, name] of [["radar", "radar-alt"], ["daily", "daily-alt"], ["recommendations", "list-alt"]]) {
+    const cover = links.find(item => item.page === page).imageUrl;
+    assert.ok(cover, page);
+    assert.equal(new URL(cover).pathname, `/${name}.jpg`);
+  }
 });
 
 // Recommended and hot podcasts are public pages. The hot list pages by links
