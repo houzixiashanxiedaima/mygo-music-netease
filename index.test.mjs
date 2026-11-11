@@ -15,8 +15,11 @@ const response = (body, cookies = [], headers = {}) => ({
 // fetch promise chain settle before the next tick.
 const flush = async () => { for (let i = 0; i < 60; i++) await Promise.resolve(); };
 
-async function setup(handler, savedSession) {
-  const storage = new Map(savedSession ? [["session", structuredClone(savedSession)]] : []);
+async function setup(handler, savedSession, savedEntries = []) {
+  const storage = new Map([
+    ...(savedSession ? [["session", structuredClone(savedSession)]] : []),
+    ...savedEntries.map(([key, value]) => [key, structuredClone(value)]),
+  ]);
   const prompts = [];
   const storageReads = [];
   globalThis.host = {
@@ -1475,7 +1478,8 @@ test("a cover earned before a QR confirmation is not reused afterwards", async (
 });
 
 // Recent history and the radio modes show a cover only after that content
-// loaded by itself. Their own load proves it; nothing is fetched for a cover.
+// loaded by itself. A local play keeps what this machine already knows, and a
+// newest play it has never seen is filled by one lightweight read.
 test("recent and radio covers come only from content that loaded", async () => {
   const requests = [];
   const { plugin } = await setup(async (url, init) => {
@@ -1518,13 +1522,217 @@ test("recent and radio covers come only from content that loaded", async () => {
   assert.equal(new URL(link(loaded, "recent").imageUrl).pathname, "/cover-4.jpg");
   // A new local play moves the history on without asking anything, and the
   // remembered recent cover is dropped rather than shown over a new first song.
+  // A new local play moves the history on. The remembered picture belongs to
+  // song 4, so it is not shown over song 5; this machine has no picture for
+  // song 5 yet, so the page makes one lightweight read for that single ID.
   const before = requests.length;
   plugin.played({ id: "5" });
   const moved = await plugin.home();
-  assert.ok(!Object.hasOwn(link(moved, "recent"), "imageUrl"));
-  // The required discovery list is the page's own load; no history, radio,
-  // detail or cover request is added for the picture.
-  assert.deepEqual(requests.slice(before), ["/api/personalized/playlist"]);
+  assert.equal(new URL(link(moved, "recent").imageUrl).pathname, "/cover-5.jpg");
+  assert.deepEqual(requests.slice(before).sort(), ["/api/personalized/playlist", "/api/v3/song/detail"]);
+  // The answer is kept: the next home load shows it without asking again.
+  const again = requests.length;
+  const settled = await plugin.home();
+  assert.equal(new URL(link(settled, "recent").imageUrl).pathname, "/cover-5.jpg");
+  assert.deepEqual(requests.slice(again), ["/api/personalized/playlist"]);
+});
+
+// A play must not lose the recent entry's picture. Artwork this machine already
+// saw for the played song is reused locally: the callback makes no request.
+test("a played song reuses the picture this machine already saw", async () => {
+  const requests = [];
+  const { plugin } = await setup(async (url, init) => {
+    const path = new URL(url).pathname;
+    requests.push(path);
+    if (path === "/api/cloudsearch/pc") return response({ code: 200, result: { songs: [song(4)], songCount: 1 } });
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/djradio/recommend/v1" || path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    const { path: eapiPath, data } = decode(init.body);
+    requests.push(eapiPath);
+    assert.equal(eapiPath, "/api/v3/song/detail");
+    assert.deepEqual(JSON.parse(data.c), [{ id: 4 }]);
+    return response({ code: 200, songs: [{ ...song(4), al: { id: 6, picUrl: "http://p1.music.126.net/known.jpg" } }], privileges: [] });
+  });
+  await plugin.search({ query: "fixture" });
+  plugin.played({ id: "4" });
+  const before = requests.length;
+  const loaded = await plugin.home();
+  const recent = loaded.sections.flatMap(section => section.links || []).find(item => item.page === "recent");
+  assert.equal(new URL(recent.imageUrl).pathname, "/known.jpg");
+  // Only the discovery list and the two public cover lists: no detail read.
+  assert.deepEqual([...new Set(requests.slice(before))].sort(),
+    ["/api/djradio/hot/v1", "/api/djradio/recommend/v1", "/api/personalized/playlist"]);
+  assert.equal(requests.slice(before).filter(path => path === "/api/v3/song/detail").length, 0);
+});
+
+// The newest local play may be a song this machine never resolved. One
+// read-only detail read for that single ID fills the entry; the answer is kept
+// per account so a second page load and a module restart reuse it.
+test("home fills a new local play's picture with one read-only read and keeps it", async () => {
+  const detail = [];
+  const handler = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/v6/playlist/detail") return response({ code: 200, playlist: { id: 3136952023 } });
+    if (path === "/api/v3/discovery/recommend/songs") return response({ code: 200, data: { dailySongs: [] } });
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 200, recommend: [] });
+    if (path === "/api/djradio/recommend/v1" || path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    const { path: eapiPath, data } = decode(init.body);
+    assert.equal(eapiPath, "/api/v3/song/detail");
+    assert.equal(data.header.MUSIC_U, "synthetic-session");
+    detail.push(JSON.parse(data.c));
+    return response({ code: 200, songs: [{ ...song(41), al: { id: 6, picUrl: "http://p1.music.126.net/fresh.jpg" } }], privileges: [] },
+      ["NMTID=renewed; Path=/"]);
+  };
+  const session = { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } };
+  const { plugin, storage } = await setup(handler, session, [["recent:8", [{ id: "41", at: 3 }]]]);
+  const link = (home) => home.sections.flatMap(section => section.links || []).find(item => item.page === "recent");
+  assert.equal(new URL(link(await plugin.home()).imageUrl).pathname, "/fresh.jpg");
+  assert.deepEqual(detail, [[{ id: 41 }]]);
+  // The read is read-only: the renewal cookie never reaches the session.
+  assert.deepEqual(storage.get("session").cookies, { MUSIC_U: "synthetic-session" });
+  await plugin.home();
+  assert.equal(detail.length, 1);
+  // A restart reads the stored picture instead of asking again.
+  const restarted = await setup(handler, session, [...storage]);
+  assert.equal(new URL(link(await restarted.plugin.home()).imageUrl).pathname, "/fresh.jpg");
+  assert.equal(detail.length, 1);
+});
+
+// A slow answer for an older play must not describe the newer one, even inside
+// one session and one generation: the song ID is captured before the request
+// and checked again before the picture is recorded.
+test("a slow picture for an older play never replaces the newer one", async () => {
+  let finishOlder;
+  const detailIDs = [];
+  const { plugin, storage } = await setup(async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/cloudsearch/pc") return response({ code: 200, result: { songs: [song(12)], songCount: 1 } });
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/djradio/recommend/v1" || path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    const { path: eapiPath, data } = decode(init.body);
+    assert.equal(eapiPath, "/api/v3/song/detail");
+    const ids = JSON.parse(data.c).map(item => item.id);
+    detailIDs.push(ids);
+    const body = { code: 200, songs: ids.map(id => ({ ...song(id), al: { id: 6, picUrl: `http://p1.music.126.net/cover-${id}.jpg` } })), privileges: [] };
+    return ids.includes(11) ? new Promise(resolve => { finishOlder = () => resolve(response(body)); }) : response(body);
+  }, undefined, [["recent:guest", [{ id: "11", at: 3 }]]]);
+  const link = (home) => home.sections.flatMap(section => section.links || []).find(item => item.page === "recent");
+  const loading = plugin.home();
+  await flush();
+  assert.equal(typeof finishOlder, "function");
+  // A newer play, with a picture this machine already saw, arrives while the
+  // older read is still pending.
+  await plugin.search({ query: "fixture" });
+  plugin.played({ id: "12" });
+  finishOlder();
+  const loaded = await loading;
+  assert.equal(new URL(link(loaded).imageUrl).pathname, "/cover-12.jpg");
+  assert.equal(storage.get("covers:guest").recent.id, "12");
+  assert.deepEqual(detailIDs, [[11], [12]]);
+});
+
+// Each mode's last naturally loaded picture belongs to its owner: it outlives
+// the short cover window, comes back after a module restart, and is never
+// shown to another account or lent to a mode that never loaded.
+test("mode covers outlive the short window, survive a restart and stay with their owner", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000000 });
+  const radio = [];
+  const handler = async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/nuser/account/get") return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/v6/playlist/detail") return response({ code: 200, playlist: { id: 3136952023 } });
+    if (path === "/api/v3/discovery/recommend/songs") return response({ code: 200, data: { dailySongs: [] } });
+    if (path === "/api/v1/discovery/recommend/resource") return response({ code: 200, recommend: [] });
+    if (path === "/api/djradio/recommend/v1" || path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    const { path: eapiPath, data } = decode(init.body);
+    if (eapiPath === "/api/v3/song/detail") return response({ code: 200, songs: [{ ...song(3), al: { id: 6, picUrl: "http://p1.music.126.net/mode.jpg" } }], privileges: [] });
+    assert.equal(eapiPath, "/api/v1/radio/get");
+    radio.push(data.mode);
+    return response({ code: 200, data: [{ ...song(3), al: { id: 6, picUrl: "http://p1.music.126.net/mode.jpg" } }] });
+  };
+  const session = { cookies: { MUSIC_U: "synthetic-session" }, profile: { id: "8" } };
+  const { plugin, storage } = await setup(handler, session);
+  await plugin.stationNext({ id: "DEFAULT" });
+  assert.deepEqual(radio, ["DEFAULT"]);
+  const stationCover = (list, id) => list.find(item => item.id === id).imageUrl;
+  assert.equal(new URL(stationCover(await plugin.stations(), "DEFAULT")).pathname, "/mode.jpg");
+  const untouched = await plugin.stations();
+  for (const id of ["FAMILIAR", "EXPLORE"]) assert.ok(!Object.hasOwn(untouched.find(item => item.id === id), "imageUrl"));
+  // Well past the five-minute cover window, the mode keeps its own picture and
+  // home asks for no radio batch to redraw it.
+  t.mock.timers.tick(6 * 60 * 1000);
+  assert.equal(new URL(stationCover(await plugin.stations(), "DEFAULT")).pathname, "/mode.jpg");
+  const home = await plugin.home();
+  assert.equal(new URL(stationCover(home.sections.flatMap(section => section.stations || []), "DEFAULT")).pathname, "/mode.jpg");
+  assert.deepEqual(radio, ["DEFAULT"]);
+  // A restart keeps the same owner's picture without asking NetEase.
+  const restarted = await setup(handler, session, [...storage]);
+  assert.equal(new URL(stationCover(await restarted.plugin.stations(), "DEFAULT")).pathname, "/mode.jpg");
+  assert.deepEqual(radio, ["DEFAULT"]);
+  // Signing out changes the owner: the guest gets no mode picture.
+  restarted.plugin.signOut();
+  const guest = await restarted.plugin.stations();
+  assert.ok(guest.every(item => !Object.hasOwn(item, "imageUrl")));
+  assert.deepEqual(radio, ["DEFAULT"]);
+});
+
+// A newest play with no picture must not turn every home load into a read: the
+// empty answer is remembered for the same short window as other misses.
+test("a newest play without a picture is not read again on every home load", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1000000 });
+  let detail = 0;
+  const { plugin } = await setup(async (url, init) => {
+    const path = new URL(url).pathname;
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/djradio/recommend/v1" || path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    const { path: eapiPath, data } = decode(init.body);
+    assert.equal(eapiPath, "/api/v3/song/detail");
+    assert.deepEqual(JSON.parse(data.c), [{ id: 61 }]);
+    detail++;
+    return response({ code: 200, songs: [song(61)], privileges: [] });
+  }, undefined, [["recent:guest", [{ id: "61", at: 3 }]]]);
+  await plugin.home();
+  assert.equal(detail, 1);
+  await plugin.home();
+  assert.equal(detail, 1);
+  t.mock.timers.tick(30000);
+  await plugin.home();
+  assert.equal(detail, 2);
+});
+
+// A picture asked for during a QR login belongs to the session that asked. The
+// confirmation replaces the session object without a new generation, so only
+// the identity check keeps it out of the new account's stored covers.
+test("a recent picture earned before a QR confirmation is not stored for the new account", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 10000 });
+  let finish;
+  const { plugin, storage } = await setup(async (url, init) => {
+    const path = new URL(url).pathname;
+    if (url.includes("/qrcode/unikey")) return response({ code: 200, unikey: "fixture-key" });
+    if (url.includes("/qrcode/client/login")) return response({ code: 803 }, ["MUSIC_U=synthetic-next; Path=/"]);
+    if (path === "/api/nuser/account/get") return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (path === "/api/personalized/playlist") return response({ code: 200, result: [] });
+    if (path === "/api/djradio/recommend/v1" || path === "/api/djradio/hot/v1") return response({ code: 200, djRadios: [] });
+    const { path: eapiPath } = decode(init.body);
+    assert.equal(eapiPath, "/api/v3/song/detail");
+    return new Promise(resolve => {
+      finish = () => resolve(response({ code: 200, songs: [{ ...song(21), al: { id: 6, picUrl: "http://p1.music.126.net/old.jpg" } }], privileges: [] }));
+    });
+  }, undefined, [["recent:guest", [{ id: "21", at: 3 }]]]);
+  const login = plugin.signIn();
+  await flush();
+  const loading = plugin.home();
+  await flush();
+  assert.equal(typeof finish, "function");
+  t.mock.timers.tick(1500);
+  await flush();
+  await login;
+  finish();
+  await loading;
+  assert.equal(storage.has("covers:guest"), false);
+  assert.equal(storage.has("covers:8"), false);
 });
 
 test("listing radio modes does not fetch unrelated playlist artwork", async () => {

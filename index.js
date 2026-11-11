@@ -60,11 +60,21 @@ const COVER_BUDGET_MS = 2500;
 const COVER_CONCURRENCY = 2;
 const COVER_TTL_MS = 5 * 60 * 1000;
 const COVER_FAILURE_TTL_MS = 30 * 1000;
-// The home entries that may carry a cover. Fixed, so the cache stays bounded.
+// The home entries whose preview answer is kept in memory. Fixed, so the cache
+// stays bounded. The recent entry and the radio modes keep their picture in
+// the owner's stored record instead (see readCoverMemory).
 const COVER_ENTRIES = new Set([
-  "radar", "daily", "recommendations", "podcasts:recommend", "podcasts:hot:0", "recent",
-  "station:DEFAULT", "station:FAMILIAR", "station:EXPLORE",
+  "radar", "daily", "recommendations", "podcasts:recommend", "podcasts:hot:0",
 ]);
+// Each radio mode's last picture that loaded naturally, with the newest local
+// play's picture, is kept per owner on this machine. Fixed keys, so the
+// record stays bounded and no mode borrows another mode's picture.
+const COVER_MEMORY_MODES = ["DEFAULT", "FAMILIAR", "EXPLORE"];
+// Pictures seen in song metadata, so a local play can reuse one without a
+// request. Public album artwork keyed by song ID, not by account.
+const SONG_COVER_LIMIT = 200;
+// A newest play with no picture is not asked again for this short window.
+const RECENT_MISS_LIMIT = 20;
 
 // MyGo 0.1.6 loads a module while holding the storage mutex. Host calls must
 // happen inside an exported action, never during module initialization.
@@ -91,6 +101,13 @@ let pendingHeart = null;
 // answer belongs to the session object and the generation that asked for it.
 const coverCache = new Map();
 let coverRun = null;
+// Artwork seen in song metadata, keyed by song ID. The value is public album
+// art, so it is the same for every account; the map only lets a local play
+// reuse a picture without a request.
+const songCovers = new Map();
+// Newest local plays this machine read and found to have no picture, so one
+// home load does not repeat the read on the next load.
+const recentCoverMisses = new Map();
 
 function currentSession() {
   if (!session) session = host.storage.get("session") || { cookies: {}, profile: null };
@@ -247,6 +264,10 @@ function persistSession() {
 function resetCovers() {
   coverCache.clear();
   coverRun = null;
+  // A session change also drops artwork learned as the previous account and
+  // the reads it may have been waiting for.
+  songCovers.clear();
+  recentCoverMisses.clear();
 }
 
 function resetStreamRequests() {
@@ -478,10 +499,13 @@ function toAlbum(album = {}) {
 
 function toTrack(track) {
   const privilege = track.privilege;
+  const album = toAlbum(track.al || track.album);
+  // A picture seen in metadata is what a later local play reuses locally.
+  rememberSongCover(String(track.id), album.imageUrl);
   return {
     id: String(track.id), name: track.name || "",
     artists: (track.ar || track.artists || []).map(toArtist),
-    album: toAlbum(track.al || track.album), duration: track.dt || track.duration || 0,
+    album, duration: track.dt || track.duration || 0,
     url: `${SITE}/song?id=${track.id}`,
     unavailable: privilege ? privilege.st < 0 || privilege.pl <= 0 : track.fee === 1 || track.fee === 4,
   };
@@ -792,6 +816,16 @@ function rememberCover(entry, picture, activeSession, generation) {
   });
 }
 
+// Keep a picture this machine already saw for a song. Bounded by insertion
+// order, so an evening of listening cannot grow it without limit.
+function rememberSongCover(id, picture) {
+  const imageUrl = coverURL(picture);
+  if (!id || !imageUrl) return;
+  songCovers.delete(id);
+  songCovers.set(id, imageUrl);
+  while (songCovers.size > SONG_COVER_LIMIT) songCovers.delete(songCovers.keys().next().value);
+}
+
 function firstCover(...values) {
   for (const value of values) {
     const picture = coverURL(value);
@@ -852,6 +886,8 @@ function homeCoverEntries(activeSession) {
   if (activeSession.cookies.MUSIC_U && activeSession.profile?.id) {
     entries.unshift("radar", "daily", "recommendations");
   }
+  // The recent entry needs one local play to name a song at all.
+  if (recentFirstID(activeSession) && recentCoverFor(activeSession) === undefined) entries.push("recent");
   return entries;
 }
 
@@ -860,6 +896,12 @@ function homeCoverEntries(activeSession) {
 async function fetchCover(entry, activeSession, generation, deadline) {
   // A worker can be queued while the listener signs out or confirms a login.
   if (activeSession !== session || generation !== epoch) return;
+  // The recent entry keeps its picture per owner and per song, not in the
+  // preview cache, so it is filled on its own.
+  if (entry === "recent") {
+    await fillRecentCover(activeSession, generation, deadline);
+    return;
+  }
   const previous = coverCache.get(entry);
   let picture = "";
   const source = COVER_SOURCES[entry];
@@ -873,6 +915,44 @@ async function fetchCover(entry, activeSession, generation, deadline) {
   // A normal page load may have provided a newer answer while this preview
   // was pending. An old success or failure must not overwrite that answer.
   if (coverCache.get(entry) === previous) rememberCover(entry, picture, activeSession, generation);
+}
+
+// One lightweight detail read for the newest local play, and only while this
+// machine has no picture for it. The song ID is captured before the request:
+// a slow answer for an older play must never be filed under a newer one.
+async function fillRecentCover(activeSession, generation, deadline) {
+  const owner = recentOwner(activeSession);
+  const songID = recentFirstID(activeSession);
+  if (!owner || !songID) return;
+  const saved = readCoverMemory(owner).recent;
+  if (saved && saved.id === songID) return;
+  const known = songCovers.get(songID);
+  if (known) {
+    rememberRecentCover(activeSession, generation, songID, known);
+    return;
+  }
+  const missedAt = recentCoverMisses.get(songID);
+  if (missedAt && Date.now() - missedAt < COVER_FAILURE_TTL_MS) return;
+  if (deadline - Date.now() <= 0) return;
+  let picture = "";
+  try {
+    const songs = await detailSongs([songID], { session: activeSession, readOnly: true, deadline });
+    picture = firstTrackCover([...songs.values()]);
+  } catch {
+    picture = "";
+  }
+  // The answer belongs to the song that was asked about and to the session
+  // that asked; anything else is stale and records nothing.
+  if (activeSession !== session || generation !== epoch) return;
+  if (recentFirstID(activeSession) !== songID) return;
+  if (!picture) {
+    recentCoverMisses.delete(songID);
+    recentCoverMisses.set(songID, Date.now());
+    while (recentCoverMisses.size > RECENT_MISS_LIMIT) recentCoverMisses.delete(recentCoverMisses.keys().next().value);
+    return;
+  }
+  rememberSongCover(songID, picture);
+  rememberRecentCover(activeSession, generation, songID, picture);
 }
 
 // At most COVER_CONCURRENCY requests, all inside one absolute deadline. A task
@@ -891,7 +971,9 @@ async function runCoverTasks(entries, activeSession, generation, deadline) {
 // joined only by the session that started it, and a late answer still has to
 // pass the session and generation checks in rememberCover.
 async function prefetchCovers(entries, activeSession, generation) {
-  const missing = entries.filter((entry) => coverFor(entry, activeSession, generation) === undefined);
+  const missing = entries.filter((entry) => entry === "recent"
+    ? recentCoverFor(activeSession) === undefined
+    : coverFor(entry, activeSession, generation) === undefined);
   if (!missing.length) return;
   if (coverRun && coverRun.session === activeSession && coverRun.generation === generation) {
     await coverRun.promise;
@@ -917,11 +999,16 @@ export async function home() {
     prefetchCovers(homeCoverEntries(activeSession), activeSession, generation),
   ]);
   // Each entry shows only its own cover. A known and expired entry is omitted
-  // rather than borrowed from a list that loaded.
+  // rather than borrowed from a list that loaded. A page that began under the
+  // previous session shows no stored picture either.
+  const current = activeSession === session && generation === epoch;
+  const memory = current ? readCoverMemory(recentOwner(activeSession)) : { recent: null, stations: {} };
+  const recentFirst = recentFirstID(activeSession);
   const entry = (name, value) => {
     const imageUrl = coverFor(name, activeSession, generation);
     return imageUrl ? { ...value, imageUrl } : value;
   };
+  const remembered = (saved, value) => saved ? { ...value, imageUrl: saved.imageUrl } : value;
   return {
     title: "发现音乐", subtitle: "网易云音乐 · 发现喜欢的音乐",
     sections: [
@@ -935,9 +1022,10 @@ export async function home() {
         entry("podcasts:hot:0", { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0" }),
       ] },
       { title: "继续收听", links: [
-        entry("recent", { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent" }),
+        remembered(recentFirst && memory.recent?.id === recentFirst ? memory.recent : null,
+          { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent" }),
       ] },
-      { title: "私人漫游", stations: stationList().map(station => entry(`station:${station.id}`, station)) },
+      { title: "私人漫游", stations: stationList().map(station => remembered(memory.stations[station.id], station)) },
       recommendations,
     ],
   };
@@ -1186,6 +1274,70 @@ function readRecent(owner) {
     .slice(0, RECENT_LIMIT);
 }
 
+// The newest local play, if this owner has one. The home cover is bound to this
+// song, never to the history's length or to the service's own list.
+function recentFirstID(activeSession) {
+  const owner = recentOwner(activeSession);
+  return owner ? readRecent(owner)[0]?.id : undefined;
+}
+
+// Artwork this machine already proved, stored per owner rather than only kept
+// in memory: a plugin update or a module restart keeps it. Keys are fixed, so
+// the record is bounded and a mode that never loaded gets no picture.
+function readCoverMemory(owner) {
+  const memory = { recent: null, stations: {} };
+  if (!owner) return memory;
+  const saved = host.storage.get(`covers:${owner}`);
+  if (!saved || typeof saved !== "object") return memory;
+  const recentID = externalID(saved.recent?.id);
+  const recentPicture = coverURL(saved.recent?.imageUrl);
+  if (recentID && recentPicture) {
+    memory.recent = { id: recentID, imageUrl: recentPicture, at: Number(saved.recent.at) || 0 };
+  }
+  for (const mode of COVER_MEMORY_MODES) {
+    const picture = coverURL(saved.stations?.[mode]?.imageUrl);
+    if (picture) memory.stations[mode] = { imageUrl: picture, at: Number(saved.stations[mode].at) || 0 };
+  }
+  return memory;
+}
+
+function writeCoverMemory(owner, update) {
+  if (!owner) return;
+  const memory = readCoverMemory(owner);
+  update(memory);
+  host.storage.set(`covers:${owner}`, { recent: memory.recent, stations: memory.stations });
+}
+
+// The recent entry shows a picture only for the song it was proved on: a new
+// first play replaces or drops it instead of keeping the old picture.
+function recentCoverFor(activeSession) {
+  const owner = recentOwner(activeSession);
+  const first = owner ? readRecent(owner)[0]?.id : undefined;
+  const saved = owner ? readCoverMemory(owner).recent : null;
+  return first && saved && saved.id === first ? saved.imageUrl : undefined;
+}
+
+// A picture may only be remembered for the song it came from, and only while
+// that song is still the newest local play. A slow answer for an older song
+// must not describe the newer one, even inside one session and one generation.
+function rememberRecentCover(activeSession, generation, songID, picture) {
+  if (activeSession !== session || generation !== epoch) return;
+  const owner = recentOwner(activeSession);
+  const id = externalID(songID);
+  const imageUrl = coverURL(picture);
+  if (!owner || !id || !imageUrl) return;
+  if (readRecent(owner)[0]?.id !== id) return;
+  writeCoverMemory(owner, (memory) => { memory.recent = { id, imageUrl, at: Date.now() }; });
+}
+
+function rememberStationCover(activeSession, generation, mode, picture) {
+  if (activeSession !== session || generation !== epoch) return;
+  const owner = recentOwner(activeSession);
+  const imageUrl = coverURL(picture);
+  if (!owner || !imageUrl || !COVER_MEMORY_MODES.includes(mode)) return;
+  writeCoverMemory(owner, (memory) => { memory.stations[mode] = { imageUrl, at: Date.now() }; });
+}
+
 // The host calls this when a track starts playing, never for a prefetched one.
 // Remember it without asking NetEase: the play itself already cost a request.
 export function played({ id }) {
@@ -1193,14 +1345,16 @@ export function played({ id }) {
   // Episodes are not songs: a podcast in a song history would play the wrong
   // audio later, so only a song ID is kept.
   if (!value) return;
-  const owner = recentOwner(currentSession());
+  const activeSession = currentSession();
+  const owner = recentOwner(activeSession);
   if (!owner) return;
   const entries = readRecent(owner).filter((entry) => entry.id !== value);
   entries.unshift({ id: value, at: Date.now() });
   host.storage.set(`recent:${owner}`, entries.slice(0, RECENT_LIMIT));
-  // The history moved, so its remembered cover may no longer be the first one.
-  // Drop it without asking NetEase: the next recent load proves a new one.
-  coverCache.delete("recent");
+  // A picture this machine already saw for this song is reused locally. A
+  // miss stays empty until the home page makes one lightweight read.
+  const known = songCovers.get(value);
+  if (known) rememberRecentCover(activeSession, epoch, value, known);
 }
 
 // The service's own list answers for every device. It is an eapi call, and
@@ -1247,10 +1401,10 @@ async function recentTracks() {
     ids.push(id);
     if (ids.length >= RECENT_LIMIT) break;
   }
-  if (!ids.length) {
-    rememberCover("recent", "", activeSession, generation);
-    return { tracks: [], note };
-  }
+  if (!ids.length) return { tracks: [], note };
+  // The newest local play is captured before the request: its picture may only
+  // be recorded while it is still the newest play.
+  const localFirst = readRecent(owner)[0]?.id;
   const byID = await detailSongs(ids, { session: activeSession });
   if (generation !== epoch || activeSession !== session) throw new Error("账号状态已改变，请重试");
   const tracks = [];
@@ -1258,9 +1412,10 @@ async function recentTracks() {
     const song = byID.get(id) || cloudSongs.get(id);
     if (song) tracks.push(toTrack(song));
   }
-  // This page loaded the songs itself, so its first real cover is knowledge
-  // about the recent entry. Showing an older picture needs no request.
-  rememberCover("recent", firstTrackCover(tracks), activeSession, generation);
+  // This page loaded the songs itself, so the newest local play's picture is
+  // known: home reuses it, bound to that song ID.
+  const localTrack = localFirst ? tracks.find((track) => track.id === localFirst) : undefined;
+  if (localTrack) rememberRecentCover(activeSession, generation, localFirst, localTrack.album?.imageUrl);
   return { tracks, note };
 }
 
@@ -1664,7 +1819,13 @@ function stationList() {
 }
 
 export async function stations() {
-  return stationList();
+  // The same stored picture home uses: a mode keeps the last picture that
+  // loaded naturally, and a mode that never loaded stays bare.
+  const memory = readCoverMemory(recentOwner(currentSession()));
+  return stationList().map(station => {
+    const saved = memory.stations[station.id];
+    return saved ? { ...station, imageUrl: saved.imageUrl } : station;
+  });
 }
 
 // Candidate only: HEART is deliberately absent from stationList until live
@@ -1791,7 +1952,6 @@ export async function stationNext({ id }) {
   const tracks = (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
   // A batch that loaded naturally proves this mode's own cover; nothing is
   // fetched for the cover and other modes keep whatever they proved.
-  rememberCover(`station:${id}`, firstTrackCover(tracks),
-    activeSession, generation);
+  rememberStationCover(activeSession, generation, id, firstTrackCover(tracks));
   return tracks;
 }
