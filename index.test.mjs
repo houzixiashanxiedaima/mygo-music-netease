@@ -1215,32 +1215,46 @@ test("guests can discover entries but private recommendations ask for sign-in", 
   assert.equal(calls, 1);
 });
 
-// Discovery links keep Home to one request; the podcast pages load only when
-// the listener opens them.
-test("home links to podcast discovery reuse sized artwork without extra requests", async () => {
-  let calls = 0;
-  const { plugin } = await setup(async (url) => {
-    calls++;
-    assert.ok(url.includes("/api/personalized/playlist"));
-    return response({ code: 200, result: Array.from({ length: 5 }, (_, id) => ({
-      id: id + 1, name: `Discovery ${id}`, picUrl: `http://p2.music.126.net/discovery-${id}.jpg`,
-    })) });
-  });
-  const home = await plugin.home();
-  const links = home.sections.flatMap((section) => section.links || []);
-  const recentLink = links.find(item => item.page === "recent");
-  assert.equal(recentLink.title, "最近播放");
-  assert.equal(new URL(recentLink.imageUrl).protocol, "https:");
-  assert.equal(new URL(recentLink.imageUrl).searchParams.get("param"), "{size}y{size}");
-  for (const [page, index] of [["podcasts:recommend", 3], ["podcasts:hot:0", 4]]) {
-    const link = links.find(item => item.page === page);
-    assert.ok(link, page);
-    const cover = new URL(link.imageUrl);
-    assert.equal(cover.protocol, "https:");
-    assert.equal(cover.pathname, `/discovery-${index}.jpg`);
-    assert.equal(cover.searchParams.get("param"), "{size}y{size}");
+// Navigation entries have no dedicated artwork. Do not borrow playlist
+// pictures, even if there is only one picture and every card would repeat it.
+test("functional entries omit borrowed covers while preserving real playlist artwork", async () => {
+  for (const count of [1, 24, 0]) {
+    let calls = 0;
+    const { plugin } = await setup(async (url) => {
+      calls++;
+      assert.ok(url.includes("/api/personalized/playlist"));
+      return response({ code: 200, result: Array.from({ length: count }, (_, id) => ({
+        id: id + 1, name: `Discovery ${id}`, picUrl: `http://p2.music.126.net/discovery-${id}.jpg`,
+      })) });
+    });
+    const home = await plugin.home();
+    const links = home.sections.flatMap(section => section.links || []);
+    const stations = home.sections.flatMap(section => section.stations || []);
+    assert.deepEqual(links.map(link => link.page), ["daily", "radar", "recommendations", "podcasts:recommend", "podcasts:hot:0", "recent"]);
+    assert.deepEqual(stations.map(station => station.id), ["DEFAULT", "FAMILIAR", "EXPLORE"]);
+    const entries = [...links, ...stations];
+    assert.equal(entries.filter(entry => !!entry.imageUrl).length, 0, "no unrelated covers on any of the nine entries");
+    assert.ok(entries.every(entry => !Object.hasOwn(entry, "imageUrl")));
+    assert.ok(entries.every(entry => entry.title || entry.name));
+    const playlists = home.sections.flatMap(section => section.playlists || []);
+    assert.equal(playlists.length, count);
+    for (let i = 0; i < count; i++) {
+      const cover = new URL(playlists[i].imageUrl);
+      assert.equal(cover.protocol, "https:");
+      assert.equal(cover.pathname, `/discovery-${i}.jpg`);
+      assert.equal(cover.searchParams.get("param"), "{size}y{size}");
+    }
+    assert.equal(calls, 1);
   }
-  assert.equal(calls, 1);
+});
+
+test("listing radio modes does not fetch unrelated playlist artwork", async () => {
+  let calls = 0;
+  const { plugin } = await setup(async () => { calls++; throw new Error("unexpected request"); });
+  const stations = await plugin.stations();
+  assert.equal(calls, 0);
+  assert.deepEqual(stations.map(station => station.id), ["DEFAULT", "FAMILIAR", "EXPLORE"]);
+  assert.ok(stations.every(station => !Object.hasOwn(station, "imageUrl")));
 });
 
 // Recommended and hot podcasts are public pages. The hot list pages by links

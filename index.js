@@ -72,7 +72,6 @@ let streamNextAllowedAt = 0;
 // Short reuse of a successful source, keyed by session, song and the quality
 // that was asked for. The value keeps the quality the response proved.
 const streamCache = new Map();
-let discoveryCovers = null;
 let heartState = null;
 let pendingHeart = null;
 
@@ -698,14 +697,7 @@ export async function suggest({ query }) {
 
 async function discoveryPlaylists() {
   const data = await request("/api/personalized/playlist", { limit: 24 });
-  const playlists = (data.result || []).map(toPlaylist);
-  // Decorative artwork for navigation, not a preview of private recommendations.
-  discoveryCovers = playlists.map(item => item.imageUrl).filter(Boolean);
-  return playlists;
-}
-
-function discoveryCover(index) {
-  return discoveryCovers?.length ? discoveryCovers[index % discoveryCovers.length] : "";
+  return (data.result || []).map(toPlaylist);
 }
 
 async function discoverySection() {
@@ -713,7 +705,7 @@ async function discoverySection() {
     return { title: "推荐歌单", playlists: await discoveryPlaylists() };
   } catch (error) {
     // Authentication failures still reach the host's sign-in flow. Optional
-    // recommendations and cover art must not hide the navigation or radio.
+    // recommendations must not hide the navigation or radio.
     if (error.code === "signIn") throw error;
     return {
       title: "推荐歌单", empty: "推荐歌单暂时无法加载，点击「查看全部」重试；其他入口仍可使用。",
@@ -747,16 +739,16 @@ export async function home() {
     title: "发现音乐", subtitle: "网易云音乐 · 发现喜欢的音乐",
     sections: [
       { title: "为你推荐", links: [
-        { title: "每日推荐", subtitle: "每天更新，为你推荐好音乐", page: "daily", imageUrl: discoveryCover(0) },
-        { title: "私人雷达", subtitle: "发现属于你的音乐", page: "radar", imageUrl: discoveryCover(1) },
-        { title: "个性化歌单", subtitle: "网易云为你推荐的歌单", page: "recommendations", imageUrl: discoveryCover(2) },
+        { title: "每日推荐", subtitle: "每天更新，为你推荐好音乐", page: "daily" },
+        { title: "私人雷达", subtitle: "发现属于你的音乐", page: "radar" },
+        { title: "个性化歌单", subtitle: "网易云为你推荐的歌单", page: "recommendations" },
       ] },
       { title: "播客发现", links: [
-        { title: "推荐播客", subtitle: "网易云为你推荐的播客", page: "podcasts:recommend", imageUrl: discoveryCover(3) },
-        { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0", imageUrl: discoveryCover(4) },
+        { title: "推荐播客", subtitle: "网易云为你推荐的播客", page: "podcasts:recommend" },
+        { title: "热门播客", subtitle: "按热度浏览，可翻页", page: "podcasts:hot:0" },
       ] },
       { title: "继续收听", links: [
-        { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent", imageUrl: discoveryCover(5) },
+        { title: "最近播放", subtitle: "最多 100 首，继续听刚才的歌", page: "recent" },
       ] },
       { title: "私人漫游", stations: stationList() },
       recommendations,
@@ -1443,17 +1435,15 @@ function stationList() {
     { id: "DEFAULT", name: "私人漫游", description: "随心听，持续推荐你可能喜欢的歌曲" },
     { id: "FAMILIAR", name: "熟悉的歌", description: "回到熟悉的旋律" },
     { id: "EXPLORE", name: "新发现", description: "探索还没听过的音乐" },
-  ].map((station, index) => ({
+  ].map(station => ({
     ...station,
     // Older hosts replace source errors with a generic toast, so keep the
     // prerequisite visible on the station card as well.
     description: `${station.description}。需在网易云 App 中开启「个性化服务」。`,
-    imageUrl: discoveryCover(index + 3),
   }));
 }
 
 export async function stations() {
-  if (discoveryCovers === null) await discoverySection();
   return stationList();
 }
 
